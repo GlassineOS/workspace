@@ -68,6 +68,21 @@ def test_new_status_done(root, capsys):
     assert not (root / "work" / "fix").exists()
 
 
+def test_done_removes_a_worktree_with_a_submodule_unless_it_holds_work(root, tmp_path, capsys):
+    ws.main(["sync"], root)
+    ws.main(["new", "fix", "alpha"], root)
+    alpha = root / "work" / "fix" / "alpha"
+    run("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(tmp_path / ".github.git"), "sub", cwd=alpha)
+    run("commit", "-qm", "sub", cwd=alpha)
+    run("push", "-q", "origin", "fix", cwd=alpha)
+    (alpha / "sub" / "f").write_text("changed")
+    assert ws.main(["done", "fix"], root) == 1
+    assert alpha.exists() and "isn't on GitHub" in capsys.readouterr().err
+    run("checkout", "-q", "--", "f", cwd=alpha / "sub")
+    assert ws.main(["done", "fix"], root) == 0
+    assert not (root / "work" / "fix").exists()
+
+
 def test_done_refuses_while_work_is_not_on_github(root, capsys):
     ws.main(["sync"], root)
     ws.main(["new", "fix", "alpha"], root)

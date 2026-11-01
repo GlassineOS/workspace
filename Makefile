@@ -1,2 +1,2 @@
 check:
-	python3 -m pytest -q
+	python3 -m pytest -q tests

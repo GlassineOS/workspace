@@ -127,7 +127,8 @@ def done(root: Path, task: str) -> None:
         lines = "\n".join(f"  {s['path']}: {s['dirty']} uncommitted, {s['unpushed']} unpushed" for s in held)
         raise WsError(f"not removing {task}, it holds work that isn't on GitHub:\n{lines}")
     for c in checkouts:
-        git("worktree", "remove", str(c), cwd=c)
+        # git won't remove a worktree with a submodule unless forced. The check above is what guards it.
+        git("worktree", "remove", "--force", str(c), cwd=c)
     if not any(directory.iterdir()):
         directory.rmdir()
     print(f"{task}: removed")

@@ -1,0 +1,36 @@
+# The identity commits in GlassineOS repositories carry. ws sync sets it in each checkout.
+[identity]
+name = "Moritz Meißelbach"
+email = "moritz@glassine.org"
+
+# The organization's repositories: `ws sync` clones them next to this file.
+
+[repo."hub"]
+url = "git@github.com:GlassineOS/hub.git"
+
+[repo.".github"]
+url = "git@github.com:GlassineOS/.github.git"
+
+[repo."docs"]
+url = "git@github.com:GlassineOS/docs.git"
+
+[repo."search"]
+url = "git@github.com:GlassineOS/search.git"
+
+[repo."builders"]
+url = "git@github.com:GlassineOS/builders.git"
+
+[repo."packages"]
+url = "git@github.com:GlassineOS/packages.git"
+
+[repo."boot"]
+url = "git@github.com:GlassineOS/boot.git"
+
+[repo."linux"]
+url = "git@github.com:GlassineOS/linux.git"
+
+[repo."android_device_onyx_noteair"]
+url = "git@github.com:GlassineOS/android_device_onyx_noteair.git"
+
+[repo."android_bootable_recovery"]
+url = "git@github.com:GlassineOS/android_bootable_recovery.git"

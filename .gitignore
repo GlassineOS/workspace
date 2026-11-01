@@ -1,0 +1,14 @@
+# Everything here is someone else's repository or a task's worktree, unless named below.
+/*
+!/.github/
+!/.gitignore
+!/.gitmodules
+!/.glassine/
+!/CLAUDE.md
+!/LICENSE
+!/Makefile
+!/README.md
+!/tests/
+!/workspace.toml
+!/ws
+__pycache__/

@@ -448,3 +448,60 @@ def test_a_move_that_cant_remove_its_source_stores_nothing(ws):
     finally:
         other.chmod(0o700)
         shutil.rmtree(other, ignore_errors=True)
+
+
+def write_entries(ws, folder, rows):
+    (ws.artifacts / folder / "manifest.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+@needs_permissions
+def test_a_delete_that_fails_says_so_in_the_tombstone_and_verify_flags_the_file(ws):
+    src = ws.old_tree / "stuck.bin"
+    src.write_text("stuck")
+    ws.art("add", src, "--in-place", "--to", "vendor", "--class", "vendor", "--what", "x", "--keep", "2000-01-01")
+    ws.old_tree.chmod(0o500)  # the file can be read but not unlinked
+    try:
+        err = ws.art("rm", "stuck.bin", "--why", "x", "--delete-in-place", code=1).stderr
+        assert "still there" in err
+        t = entries(ws, "vendor")[0]["tombstone"]
+        assert t["file"] == "delete failed" and t["error"]
+        out = ws.art("verify", code=1).stdout
+        assert "still there  stuck.bin" in out and "delete failed" in out
+    finally:
+        ws.old_tree.chmod(0o700)
+    src.unlink()
+    assert ws.art("verify").stdout == ""
+
+
+def test_verify_flags_a_tombstone_left_between_the_write_and_the_unlink(ws):
+    ws.add("a.bin")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+    row = entries(ws)[0]
+    row["tombstone"] = {"when": "2000-01-01T00:00:00Z", "by": "me", "why": "x", "retention": None, "overrode": [],
+                        "search": {}, "file": "deleting"}
+    write_entries(ws, "bases", [row])
+    out = ws.art("verify", code=1).stdout
+    assert f"still there  a.bin: {path}" in out and "deleting" in out
+
+
+def test_a_file_that_vanishes_before_the_delete_is_recorded_as_missing(ws, monkeypatch):
+    ws.add("a.bin")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+    real = Path.unlink
+
+    def vanish(self, *args, **kwargs):
+        real(self, *args, **kwargs)
+        raise FileNotFoundError(self)
+
+    monkeypatch.setattr(Path, "unlink", vanish)
+    report = artstore.remove("a.bin", why="x", by="me")
+    monkeypatch.undo()
+    assert report["entry"]["tombstone"]["file"] == "was missing" and not path.exists()
+    assert entries(ws)[0]["tombstone"]["file"] == "was missing"
+
+
+def test_a_re_added_name_doesnt_make_its_old_tombstone_look_undeleted(ws):
+    ws.add("a.bin", content="same\n")
+    ws.art("rm", "a.bin", "--why", "x")
+    ws.add("a.bin", content="same\n")  # same id and name, so the same path in the store
+    assert ws.art("verify").stdout == ""

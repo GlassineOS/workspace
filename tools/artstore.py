@@ -377,14 +377,23 @@ def remove(ref: str, *, why: str, by: str, retention: tuple[str, str] | None = N
         for stored in entries:
             if stored["name"] == entry["name"] and not stored.get("tombstone"):
                 file = "was missing" if not present else "kept in place" if entry.get("in_place") and not delete_in_place else "deleted"
-                stored["tombstone"] = {"when": utc(), "by": by, "why": why, "retention": lifted, "overrode": reasons,
-                                       "search": stats, "file": file}
-                _write(folder, entries)
+                tombstone = {"when": utc(), "by": by, "why": why, "retention": lifted, "overrode": reasons,
+                             "search": stats, "file": "deleting" if file == "deleted" else file}
+                stored["tombstone"] = tombstone
+                _write(folder, entries)  # first: a crash after this leaves a file with a tombstone, which verify flags
                 if file == "deleted":
                     try:
                         path.unlink()
+                    except FileNotFoundError:
+                        tombstone["file"] = "was missing"
                     except OSError as e:
-                        raise ToolError(f"{entry['name']} has its tombstone, but its file is still there: {e}") from None
+                        tombstone["file"], tombstone["error"] = "delete failed", str(e)
+                        _write(folder, entries)
+                        raise ToolError(f"{entry['name']} has its tombstone, but its file is still there and the tombstone "
+                                        f"says so: {e}. Remove {path} by hand.") from None
+                    else:
+                        tombstone["file"] = "deleted"
+                    _write(folder, entries)
                 return {**report, "entry": stored}
     raise ToolError(f"{entry['name']} was removed while this ran")
 
@@ -404,6 +413,12 @@ def verify(refs: list[str]) -> tuple[list[str], list[str]]:
             problems.append(f"changed  {entry['name']}: {path}")
     unindexed = []
     if not refs:
+        live = {location(e) for _, e in everything() if not e.get("tombstone")}
+        for _, entry in everything():
+            tombstone = entry.get("tombstone")
+            path = location(entry)
+            if tombstone and tombstone["file"] in ("deleting", "deleted", "delete failed") and path.exists() and path not in live:
+                problems.append(f"still there  {entry['name']}: {path} (its tombstone says {tombstone['file']})")
         for folder in (artifacts(), *(artifacts() / f for f in FOLDERS)):
             if folder.is_dir() and folder.stat().st_mode & 0o077:
                 problems.append(f"too open {folder}: should be mode 0700")

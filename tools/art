@@ -17,7 +17,7 @@ unless --delete-in-place.
 
 art rm searches every checkout, worktree and the old tree for the id, name and path, and refuses on
 a hit, on keep: always or user, and before a keep date. It leaves a tombstone. Only the person
-overrides those: hub retention decisions don't exist yet, so for now --retention-said names the file
+overrides those: the hub doesn't record retention decisions, so --retention-said names the file
 and carries the person's words, which go in the tombstone. Nothing proves them, and an agent uses it
 only for words the person typed to it. Binary files aren't searched: a reference is text.
 """

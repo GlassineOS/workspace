@@ -43,6 +43,8 @@ class FakeDevice:
 script=$(cat)
 printf '%s\\n----\\n' "$script" >> "$root/commands.log"
 [ -e "$root/unreachable" ] && exit 255
+# fail-when: strings, one a line. A script holding one gets ssh's own failure and doesn't run
+if [ -s "$root/fail-when" ] && printf '%s\\n' "$script" | grep -qF -f "$root/fail-when"; then exit 255; fi
 [ -e "$root/hang" ] && exec sleep 5
 cd "$root"
 export PATH="$root/bin:$PATH"
@@ -751,6 +753,36 @@ def test_a_refused_take_spends_nothing(rig, hub):
     h = hub(decision_use=HUB_YES, decision_holding={"ok": True, "holding": True})
     rig.take("a", "--does", "reboot", "--go", "7", code=1)
     assert not [r for r in h.seen if r["op"] == "decision.use"] and not rig.device.lock.exists()
+
+
+def spends(h):
+    return [r for r in h.seen if r["op"] == "decision.use"]
+
+
+def test_a_write_that_fails_after_the_checks_spends_no_run(rig, hub):
+    h = hub(decision_use=HUB_YES)
+    (rig.device.root / "fail-when").write_text("> lock.d/check\n")  # the take's record on the device can't be written
+    done = rig.take("a", "--does", "reboot", "--go", "7", code=1)
+    assert "can't reach the device" in done.stderr
+    assert not spends(h) and not rig.device.lock.exists()
+
+
+def test_a_no_from_the_hub_leaves_the_queue_the_records_and_the_base_alone(rig, hub):
+    hub(decision_use=HUB_NO)
+    d = rig.device
+    rig.dev("wait", "--as", "a", "--on", "x", "--until", "1h")
+    d.override("old", owner="z", boot_id="boot-0", target="/usr/x")  # a dead record: a take that gets through clears it
+    rig.take("a", "--does", "suspend", "--go", "7", code=1)
+    assert len(d.queue()) == 1 and (d.store / "overrides.d" / "old").exists() and not (d.store / "hangcheck-base").exists()
+    assert not d.lock.exists()
+
+
+def test_a_clean_up_that_fails_after_the_hubs_yes_doesnt_refuse_the_take(rig, hub):
+    h = hub(decision_use=HUB_YES)
+    (rig.device.root / "fail-when").write_text("> hangcheck-base\n")
+    ran = rig.tmp / "ran"
+    done = rig.take("a", "--does", "reboot", "--go", "7", cmd=["touch", ran])
+    assert ran.exists() and "clean-up" in done.stderr and len(spends(h)) == 1
 
 
 def test_a_go_the_hub_says_no_to_gives_the_lock_back(rig, hub):

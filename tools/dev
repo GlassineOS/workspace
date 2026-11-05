@@ -155,8 +155,8 @@ def note(checks) -> None:
 
 
 def go_table(actions: list[str], a, config, spend: bool = False) -> None:
-    """The take table, once the action list is known. It raises on a refusal. A take that gets through spends a run of its
-    go, so that's asked last; a join only checks."""
+    """The take table, once the action list is known. It raises on a refusal. With spend, a yes uses up a run of the go,
+    so that is asked after everything that can fail and be given back, and nothing the hub can't undo comes before it."""
     if not actions:
         return
     if devlib.hub_holding() is True and set(actions) - WHILE_YOU_HOLD:
@@ -397,22 +397,36 @@ def passed(a, config, device, st, name) -> None:
     if bad and not a.dirty:
         raise ToolError("the device isn't clean, the lock is given back: " + "; ".join(map(str, bad)) + ". --dirty WHY to run anyway")
     note(checks)
-    go_table(a.actions, a, config, spend=True)
 
-    steps = [devlib.move_hangcheck_base(st)]
+    # Inside lock.d: a refusal gives the lock back, and these go with it.
+    record = []
     for key, value in (("go", go_record(a, a.actions)), ("dirty", word(a.dirty)), ("ahead", word(a.ahead))):
         if value:
-            steps.append(put(f"lock.d/{key}", value))
-    steps.append(put("lock.d/check", word("; ".join(str(c) for c in checks if c.state != "ok"))))
+            record.append(put(f"lock.d/{key}", value))
+    record.append(put("lock.d/check", word("; ".join(str(c) for c in checks if c.state != "ok"))))
+    # Outside it: moving the base and clearing entries is not undone by giving the lock back. And it can wait, as a
+    # base that didn't move only stops the next take again, and an entry left behind expires.
+    tidy = [devlib.move_hangcheck_base(st)]
     if left_gone:
-        steps.append("rm -f left.d/cpu-renderer")
+        tidy.append("rm -f left.d/cpu-renderer")
     for e in queue:
         if e["expired"] or e["who"] == name:
-            steps.append(f"rm -f {shlex.quote('queue.d/' + e['file'])}")
-    for key, record in st.overrides.items():
-        if st.dead_override(record):
-            steps.append(f"rm -f {shlex.quote('overrides.d/' + key)}")
-    device.do("\n".join(steps))
+            tidy.append(f"rm -f {shlex.quote('queue.d/' + e['file'])}")
+    for key, override in st.overrides.items():
+        if st.dead_override(override):
+            tidy.append(f"rm -f {shlex.quote('overrides.d/' + key)}")
+
+    if not a.actions:  # nothing to ask the hub: one trip
+        device.do("\n".join(tidy + record))
+        return
+    device.do("\n".join(record))
+    # Last: only a take that has got through everything spends a run, and the hub can't take one back. A device that
+    # fails above costs nothing; one that fails below costs the clean-up, not the take.
+    go_table(a.actions, a, config, spend=True)
+    try:
+        device.do("\n".join(tidy))
+    except ToolError as e:
+        print(f"dev: the take stands, but the clean-up on the device didn't finish (the next take may stop on it): {e}", file=sys.stderr)
 
 
 def release(a) -> int:

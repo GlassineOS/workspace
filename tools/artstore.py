@@ -48,19 +48,50 @@ def _manifest(folder: str) -> Path:
     return artifacts() / folder / _MANIFEST
 
 
+_TEXT_FIELDS = ("id", "name", "path", "sha256", "class", "what", "by", "keep")
+
+
+def _check_entry(entry: object, where: str) -> None:
+    """A hand-edited manifest line has to be an entry the commands can use, or they stop with words."""
+    def bad(why: str):
+        raise ToolError(f"{where} {why}: fix it by hand, nothing was changed")
+
+    if not isinstance(entry, dict):
+        bad("isn't an entry (a JSON object)")
+    for field in _TEXT_FIELDS:
+        if not isinstance(entry.get(field), str):
+            bad(f"has no {field} as text")
+    if not isinstance(entry.get("size"), int) or isinstance(entry.get("size"), bool):
+        bad("has no size as a number")
+    try:
+        check_keep(entry["keep"])
+    except ToolError as e:
+        bad(f"has a keep that fails: {e}")
+    tombstone = entry.get("tombstone")
+    if tombstone is not None and not (isinstance(tombstone, dict) and isinstance(tombstone.get("when"), str)
+                                      and isinstance(tombstone.get("why"), str)):
+        bad("has a tombstone without a when and a why")
+
+
 def read(folder: str) -> list[dict]:
     path = _manifest(folder)
     if not path.exists():
         return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise ToolError(f"{path} isn't UTF-8 text (byte {e.start}): fix it by hand, nothing was changed") from None
     entries = []
     # Split on "\n" only: splitlines() also splits on U+2028, U+2029 and U+0085, which _write leaves raw.
-    for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+    for number, line in enumerate(text.split("\n"), 1):
         if not line:
             continue
         try:
-            entries.append(json.loads(line))
+            entry = json.loads(line)
         except json.JSONDecodeError:
             raise ToolError(f"{path} line {number} isn't JSON: fix it by hand, nothing was changed") from None
+        _check_entry(entry, f"{path} line {number}")
+        entries.append(entry)
     return entries
 
 
@@ -233,7 +264,10 @@ def places() -> list[Path]:
         patterns = [p for p in injected.split(os.pathsep) if p]
     else:
         config = base / "workspace.toml"
-        settings = tomllib.loads(config.read_text()) if config.exists() else {}
+        try:
+            settings = tomllib.loads(config.read_text(encoding="utf-8")) if config.exists() else {}
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+            raise ToolError(f"{config} can't be read: {e}") from None
         art = settings.get("art", {})
         patterns = art.get("search", DEFAULT_PLACES) if isinstance(art, dict) else None
         if not isinstance(patterns, (list, tuple)) or not all(isinstance(p, str) for p in patterns):

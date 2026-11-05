@@ -651,3 +651,48 @@ def test_nothing_to_search_is_a_refusal_not_a_clear_result(ws, monkeypatch):
         err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
         assert "has to be a list" in err and str(config) in err
     assert ws.art("path", "a.bin").stdout
+
+
+@pytest.mark.parametrize("change, words", [
+    (lambda e: e.update(keep="soon"), "keep"),
+    (lambda e: e.pop("sha256"), "sha256"),
+    (lambda e: e.update(size="big"), "size"),
+    (lambda e: e.update(tombstone="gone"), "tombstone"),
+])
+def test_a_hand_edited_entry_stops_every_command_in_words_naming_file_and_line(ws, change, words):
+    ws.add("a.bin")
+    ws.add("b.bin")
+    path = Path(ws.art("path", "b.bin").stdout.strip())
+    rows = entries(ws)
+    change(rows[1])
+    write_entries(ws, "bases", rows)
+    manifest = ws.artifacts / "bases" / "manifest.jsonl"
+    before = manifest.read_text()
+    for args in (("find",), ("path", "a.bin"), ("verify",), ("rm", "b.bin", "--why", "x"),
+                 ("add", ws.file("c.bin"), "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user")):
+        err = ws.art(*args, code=1).stderr
+        assert f"{manifest} line 2" in err and words in err and "Traceback" not in err, err
+    assert manifest.read_text() == before and path.exists()
+
+
+@pytest.mark.parametrize("line", ["[1, 2]", "3", '"text"', "null"])
+def test_a_manifest_line_that_isnt_an_object_stops_in_words(ws, line):
+    ws.add("a.bin")
+    manifest = ws.artifacts / "bases" / "manifest.jsonl"
+    manifest.write_text(manifest.read_text() + line + "\n")
+    err = ws.art("find", code=1).stderr
+    assert f"{manifest} line 2 isn't an entry" in err and "Traceback" not in err
+
+
+def test_a_manifest_that_isnt_utf8_or_a_broken_workspace_toml_stops_in_words(ws, monkeypatch):
+    ws.add("a.bin")
+    manifest = ws.artifacts / "bases" / "manifest.jsonl"
+    manifest.write_bytes(manifest.read_bytes() + b'{"x": "caf\xe9"}\n')
+    err = ws.art("find", code=1).stderr
+    assert f"{manifest} isn't UTF-8" in err and "Traceback" not in err
+    manifest.write_bytes(manifest.read_bytes().split(b"\n")[0] + b"\n")
+    monkeypatch.delenv("GLASSINE_ART_PLACES")
+    config = ws.home / "workspace.toml"
+    config.write_text("[art\nsearch = 1\n")
+    err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    assert str(config) in err and "line 1" in err and "Traceback" not in err

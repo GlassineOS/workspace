@@ -84,6 +84,17 @@ def add(a) -> int:
 
 def set_(a) -> int:
     said = []
+    if a.retract and a.close:
+        raise wslib.ToolError("--retract and --close are two writes: one at a time")
+    if a.retract or a.close:
+        flag = "--retract" if a.retract else "--close"
+        extra = [name for name, given in (("words", a.words), ("provenance", tag(a)), ("--replaces", a.replaces),
+                                          ("--open", a.open)) if given]
+        if extra or (a.close and a.by):
+            raise wslib.ToolError(f"{flag} takes {'--by and --why' if a.retract else '--why'} only, and "
+                                  f"{', '.join(extra) or '--by'} would be dropped, so nothing was written")
+    elif a.by or a.why:
+        raise wslib.ToolError("--by and --why go with --retract or --close, and would be dropped, so nothing was written")
 
     def edit(text: str) -> str:
         if a.retract:

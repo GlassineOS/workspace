@@ -58,9 +58,13 @@ def sources() -> list[dict]:
         if not name or not path or kind not in _KINDS or name == "notes":
             raise ToolError(f"workspace.toml: a [[notes.source]] needs a name other than notes, a path, "
                             f"and a kind of text or transcripts: {entry}")
+        pattern = entry.get("glob", _KINDS[kind])
+        if not isinstance(pattern, str) or not pattern or Path(pattern).is_absolute():
+            raise ToolError(f"workspace.toml: the glob of a [[notes.source]] is a pattern inside its path, "
+                            f"not empty or absolute: {entry}")
         root = Path(path).expanduser()
         found.append({"name": name, "kind": kind, "root": root if root.is_absolute() else home() / root,
-                      "glob": entry.get("glob", _KINDS[kind])})
+                      "glob": pattern})
     return found
 
 
@@ -85,10 +89,23 @@ def _note_rows(path: Path) -> list[tuple]:
     return rows
 
 
+def _clean(text: str) -> str:
+    """Text SQLite can store: a lone surrogate, which JSON escapes can make (\\ud83d cut in half), becomes U+FFFD."""
+    return text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+
+
 def _chunks(text: str):
+    """Pieces of at most _CHUNK characters, cut where there is whitespace so no word is split. A word
+    longer than a chunk is cut hard, and is then no word anyone could search for whole."""
     while text:
-        yield text[:_CHUNK]
-        text = text[_CHUNK:]
+        if len(text) <= _CHUNK:
+            yield text
+            return
+        window = text[:_CHUNK + 1]  # one more, so a space right at the end is a cut too
+        cut = max(window.rfind(space) for space in " \t\n")
+        cut = cut if cut > 0 else _CHUNK
+        yield text[:cut]
+        text = text[cut:].lstrip()
 
 
 def _text_rows(path: Path) -> list[tuple]:
@@ -151,6 +168,8 @@ def _transcript_rows(path: Path) -> list[tuple]:
 
 
 def _walk(warn) -> list[tuple[str, Path, callable]]:
+    """Every file once, under the first name that reaches it: the notes, then the sources in order.
+    A source may cover the workspace, which holds notes/, or sit inside another one."""
     files = [("notes", path, _note_rows) for path in noteslib.topics()]
     for source in sources():
         if not source["root"].is_dir():
@@ -158,7 +177,13 @@ def _walk(warn) -> list[tuple[str, Path, callable]]:
             continue
         read = _text_rows if source["kind"] == "text" else _transcript_rows
         files += [(source["name"], path, read) for path in sorted(source["root"].glob(source["glob"]))]
-    return files
+    once, found = set(), []
+    for source, path, read in files:
+        key = path.resolve()
+        if key not in once:
+            once.add(key)
+            found.append((source, path, read))
+    return found
 
 
 def _open(sqlite3) -> "sqlite3.Connection":
@@ -196,19 +221,21 @@ def _refresh(db, warn) -> None:
             info = path.stat()
             if not stat.S_ISREG(info.st_mode):  # never open a FIFO: it would block
                 continue
-            seen.add(str(path))
-            old = known.get(str(path))
+            name = _clean(str(path))
+            seen.add(name)
+            old = known.get(name)
             if old and old[1:] == (source, info.st_mtime_ns, info.st_size):
                 continue
-            rows = read(path)
-        except OSError as e:
-            warn(f"{source}: {path} couldn't be read, so it wasn't searched: {e.strerror}")
+            rows = [tuple(_clean(v) if isinstance(v, str) else v for v in row) for row in read(path)]
+        except (OSError, ValueError, RecursionError) as e:  # one file's trouble is that file's warning
+            why = e.strerror if isinstance(e, OSError) and e.strerror else type(e).__name__
+            warn(f"{source}: {path} couldn't be read, so it wasn't searched: {why}")
             continue
         with db:
             if old:
                 _forget(db, old[0])
             fid = db.execute("INSERT INTO files(path, source, mtime, size) VALUES (?, ?, ?, ?)",
-                             (str(path), source, info.st_mtime_ns, info.st_size)).lastrowid
+                             (name, source, info.st_mtime_ns, info.st_size)).lastrowid
             for row in rows:
                 rid = db.execute("INSERT INTO rows(file, rank, state, label, place, text) VALUES (?, ?, ?, ?, ?, ?)",
                                  (fid, *row)).lastrowid
@@ -232,6 +259,7 @@ def find(words: list[str], limit: int, warn) -> tuple[list[dict], int]:
     query = _query(words)
     sqlite3 = _sqlite3()
     place = cache()
+    db = None
     for attempt in (1, 2):
         try:
             with locked(place / ".lock"):
@@ -244,6 +272,12 @@ def find(words: list[str], limit: int, warn) -> tuple[list[dict], int]:
                 ORDER BY r.rank, bm25(fts), r.id LIMIT ?""", (query, limit)).fetchall()
             break
         except sqlite3.DatabaseError as e:  # regenerable: a damaged index is rebuilt once
+            if isinstance(e, (sqlite3.OperationalError, sqlite3.IntegrityError)):
+                # busy or full, or a constraint: not damage, and a rebuild would pull the file out from under
+                # whoever has it open
+                raise ToolError(f"the search index at {place} can't be used just now, and it wasn't touched: {e}") from None
+            if db is not None:
+                db.close()
             if attempt == 2:
                 raise ToolError(f"the search index at {place} can't be used: {e}") from None
             warn("the search index was damaged, so it's being rebuilt")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 import subprocess
 import tomllib
@@ -22,11 +23,17 @@ SECTIONS = ("Current", "Open", "Log")
 KINDS = ("seen", "inferred", "guess", "user", "archive")
 _TOPIC = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*/[A-Za-z0-9][A-Za-z0-9._+-]*")
 _ID = re.compile(r"c[0-9]+")
-_RETRACTED = re.compile(r"\bRETRACTED ([0-9]{4}-[0-9]{2}-[0-9]{2}) by (c[0-9]+)\b")
+# What the tool writes after a claim, in exactly this shape. Only the shape is a mark: the word alone,
+# or a date and an id in other words, is text, and add and set refuse words that fake a mark.
+_REPLACED = re.compile(r"(?<!\S)REPLACED [0-9]{4}-[0-9]{2}-[0-9]{2} by (c[0-9]+)\.(?=\s|$)")
+_RETRACTED = re.compile(r"(?<!\S)RETRACTED ([0-9]{4}-[0-9]{2}-[0-9]{2}) by (c[0-9]+): ")
 # The org scan checks only the first address-shaped line of a file, so an allowed one hides the
-# rest. Until that's fixed there, _flagged_addresses checks them all, with the scan's own patterns.
-_ADDRESS = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:])")
-_ADDRESS_OK = re.compile(r"(00:){5}00|([Ff][Ff]:){5}[Ff][Ff]|(([0-9A-Fa-f]{2}:){2})?(00:00:5[Ee]:).*")
+# rest, and it passes an address that touches a colon (addr:AA:..., AA:...: up) or uses dashes. Until
+# that's fixed there (GlassineOS/.github#3 covers part of it), _flagged_addresses checks every address
+# with these. They are stricter than the scan's own on purpose: a group of hex digits next to the
+# address is what makes it longer, a colon or a letter is not.
+_ADDRESS = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])")
+_ADDRESS_OK = re.compile(r"(00:){5}00|([Ff][Ff]:){5}[Ff][Ff]|00:00:5[Ee]:.*")  # zero, broadcast, documentation
 _SCAN = Path(".glassine/org/scripts/safety-scan.sh")
 _SECONDS = 120
 _in_hook = False
@@ -84,11 +91,21 @@ def _tag_end(words: str) -> int | None:
 
 def _read_claim(item: Item, problem) -> None:
     words = item.words
+    if not words:
+        problem("a bullet with nothing in it")
+        return
     if m := re.match(r"(c[0-9]+)\s+", words):
-        item.id, words = m.group(1), words[m.end():]
-    if not words.startswith("["):
+        # "c5 is broken" in Log is a plain line: an id is one only with provenance after it, or outside Log
+        if words[m.end():].startswith("[") or item.section != "Log":
+            item.id, words = m.group(1), words[m.end():]
+    # "[wip] trying it" in Log with no id is plain too: a bracket is provenance when it names a kind
+    plain = (item.section == "Log" and not item.id
+             and (not words.startswith("[") or words[1:].split("]")[0].partition(":")[0].strip() not in KINDS))
+    if plain or not words.startswith("["):
         item.text = words
-        if item.id:
+        if plain:
+            pass
+        elif item.id:
             problem(f"{item.id} has no provenance: seen, inferred, guess, user or archive")
         elif item.section != "Log":
             problem(f"a claim in {item.section} needs provenance: {words[:40]}")
@@ -102,7 +119,7 @@ def _read_claim(item: Item, problem) -> None:
         if item.kind not in KINDS:
             problem(f"provenance is seen, inferred, guess, user or archive, not {item.kind}")
             item.kind = None
-        elif item.kind == "inferred" and not item.value:
+        elif item.kind == "inferred" and not item.bases():  # "," has a value and no basis
             problem(f"{item.id or 'a claim'} is inferred, but not from what: [inferred: c12]")
         elif item.kind == "seen":
             evidence = item.evidence()
@@ -111,13 +128,10 @@ def _read_claim(item: Item, problem) -> None:
                         "[seen: base=ID, art=NAME] or [seen: base=ID, cmd=WORDS]")
         if not item.text:
             problem(f"{item.id or 'a claim'} says nothing after its provenance")
-    if "RETRACTED" in item.text:
-        if m := _RETRACTED.search(item.text):
-            item.retracted_by = m.group(2)
-            if not item.id:
-                problem("a retraction needs the claim's id")
-        else:
-            problem(f"{item.id or 'a claim'}: a retraction reads RETRACTED YYYY-MM-DD by cN")
+    if m := _RETRACTED.search(item.text + " "):
+        item.retracted_by = m.group(2)
+        if not item.id:
+            problem("a retraction needs the claim's id")
 
 
 def parse(text: str) -> Doc:
@@ -180,8 +194,21 @@ def _grounded(claim: str, current: dict[str, Item], path: tuple[str, ...] = ()) 
     return item.kind != "inferred" or all(_grounded(base, current, (*path, claim)) for base in item.bases())
 
 
-def lint(text: str) -> list[tuple[int, str]]:
-    """What keeps this text out: line number and words. Nothing means it may go in."""
+def entering(before: str | None, after: str) -> set[str]:
+    """Ids of the Current claims in `after` that weren't there as they are in `before`. Only these are
+    checked for the artifacts they name: an artifact has retention, so it may go later, and then the
+    claim stays as the record of what was seen while it was there."""
+    def arts(text: str | None) -> dict[str, tuple]:
+        doc = parse(text or "")
+        return {i.id: tuple(i.evidence().get("art", [])) for i in doc.items if i.section == "Current" and i.id}
+
+    old = arts(before)
+    return {claim for claim, named in arts(after).items() if old.get(claim) != named}
+
+
+def lint(text: str, only: set[str] | None = None) -> list[tuple[int, str]]:
+    """What keeps this text out: line number and words. Nothing means it may go in. `only` names the
+    claims whose artifacts are looked up (see `entering`); without it every claim's are."""
     doc = parse(text)
     problems = list(doc.problems)
     ids: dict[str, Item] = {}
@@ -208,11 +235,11 @@ def lint(text: str) -> list[tuple[int, str]]:
         elif item.kind in ("guess", "archive"):
             problem(f"{name} is {item.kind}, so it stays in Open or Log until it's seen again or the person says so")
         elif item.kind == "seen":
-            for artifact in item.evidence().get("art", []):
+            for artifact in item.evidence().get("art", []) if only is None or item.id in only else []:
                 try:
                     artstore.path_of(artifact)
-                except ToolError:
-                    problem(f"{name} names art={artifact}, which isn't in artifacts/")
+                except ToolError as e:  # its words say removed when and why, or ambiguous, or a broken manifest
+                    problem(f"{name} names art={artifact}: {e}")
         elif item.kind == "inferred" and item.id:
             for base in item.bases():
                 if base not in current:
@@ -228,8 +255,13 @@ def next_id(doc: Doc) -> str:
     return f"c{max(used, default=0) + 1}"
 
 
+def _heading(lines: list[str], text: str) -> int | None:
+    """Where this heading is, the way parse reads it: a space after it doesn't make it another."""
+    return next((n for n, line in enumerate(lines) if line.rstrip() == text), None)
+
+
 def _insert(lines: list[str], section: str, bullet: str) -> None:
-    start = lines.index(f"## {section}") + 1
+    start = _heading(lines, f"## {section}") + 1
     end = next((n for n in range(start, len(lines)) if lines[n].startswith("## ")), len(lines))
     while end > start and not lines[end - 1].strip():
         end -= 1
@@ -239,12 +271,13 @@ def _insert(lines: list[str], section: str, bullet: str) -> None:
 def _log(lines: list[str], bullet: str) -> None:
     """Put a line under today's heading in Log, opening the heading if it isn't there."""
     today = f"### {date.today().isoformat()}"
-    if today not in lines:
+    at = _heading(lines, today)
+    if at is None:
         while lines and not lines[-1].strip():
             lines.pop()
         lines.extend([today, bullet, ""])
         return
-    end = lines.index(today) + 1
+    end = at + 1
     while end < len(lines) and lines[end].strip() and not lines[end].startswith("#"):
         end += 1
     lines.insert(end, bullet)
@@ -280,6 +313,14 @@ def _take_out(lines: list[str], dependents: list[str], root: str) -> None:
         _log(lines, _marked(item, f"OUT {today}: rested on {root}."))
 
 
+def _no_marks(words: str) -> str:
+    """Words that fake what the tool writes would be read as it: refuse them, so a mark only comes from here."""
+    if _RETRACTED.search(words + " ") or _REPLACED.search(words + " "):
+        raise ToolError("these words have the shape of a mark the tool writes (RETRACTED or REPLACED, a date, "
+                        "by cN): say it another way, and use notes set --retract to retract")
+    return words
+
+
 def _find(doc: Doc, claim: str) -> Item:
     item = doc.by_id().get(claim)
     if item is None:
@@ -291,6 +332,9 @@ def add(text: str, words: str, tag: str | None, *, open_item: bool = False) -> t
     """A new line in Log, as things happen, or a new Open item. New text and its id."""
     doc = parse(text)
     lines = list(doc.lines)
+    _no_marks(words)
+    if not words.strip():
+        raise ToolError("nothing to write: the words are empty")
     if tag is None and open_item:
         raise ToolError("an Open item needs provenance: --guess, for one")
     claim = next_id(doc) if tag else None
@@ -307,6 +351,9 @@ def set_claim(text: str, words: str, tag: str, *, replaces: str | None = None,
     """A claim in Current (or Open), replacing another in place if asked. The old one goes to Log."""
     doc = parse(text)
     lines = list(doc.lines)
+    _no_marks(words)
+    if not words.strip():
+        raise ToolError("nothing to write: the words are empty")
     section = "Open" if open_item else "Current"
     claim = next_id(doc)
     bullet = f"- {claim} [{tag}] {words}"
@@ -316,6 +363,8 @@ def set_claim(text: str, words: str, tag: str, *, replaces: str | None = None,
     old = _find(doc, replaces)
     if old.retracted_by:
         raise ToolError(f"{replaces} is already retracted")
+    if m := _REPLACED.search(old.text + " "):
+        raise ToolError(f"{replaces} is already replaced, by {m.group(1)}: one current state is replaced in place")
     dependents = _dependents(doc, replaces)
     old_line = _marked(old, f"REPLACED {date.today().isoformat()} by {claim}.")
     if old.section == "Log":
@@ -336,6 +385,7 @@ def retract(text: str, claim: str, by: str, why: str) -> tuple[str, list[str]]:
     """Mark a claim retracted, and take out of Current what rests on it. Nothing is deleted."""
     doc = parse(text)
     lines = list(doc.lines)
+    _no_marks(why)
     item = _find(doc, claim)
     witness = _find(doc, by)
     if by == claim:
@@ -345,6 +395,8 @@ def retract(text: str, claim: str, by: str, why: str) -> tuple[str, list[str]]:
     if item.retracted_by:
         raise ToolError(f"{claim} is already retracted")
     dependents = _dependents(doc, claim)
+    if by in dependents:
+        raise ToolError(f"{by} rests on {claim}, so it can't be what shows {claim} wrong")
     line = _marked(item, f"RETRACTED {date.today().isoformat()} by {by}: {why}")
     if item.section == "Log":
         lines[item.start:item.end] = [line]
@@ -359,6 +411,7 @@ def close(text: str, claim: str, why: str) -> str:
     """An Open item that's settled, or no longer asked, goes to Log with why."""
     doc = parse(text)
     lines = list(doc.lines)
+    _no_marks(why)
     item = _find(doc, claim)
     if item.section != "Open":
         raise ToolError(f"{claim} isn't in Open")
@@ -416,7 +469,7 @@ def _hook_text() -> str:
     return f"""#!/bin/sh
 # Written by tools/notes, for hand edits: the same scan and lint as notes add and set.
 top=$(git rev-parse --show-toplevel)
-for tool in "$top/../tools/notes" "{tool}"; do
+for tool in "$top/../tools/notes" {shlex.quote(str(tool))}; do
   [ -x "$tool" ] && exec "$tool" hook
 done
 echo "notes: tools/notes isn't there, so nothing can scan this commit: refused" >&2
@@ -430,7 +483,9 @@ def _ensure_repo() -> None:
     if not (root / ".git").exists():
         _git("init", "-q", "-b", "main")
     identity = settings().get("identity")
-    if identity and _git("config", "user.name", check=False).returncode:
+    if identity and not (isinstance(identity, dict) and identity.get("name") and identity.get("email")):
+        raise ToolError(f"{home() / 'workspace.toml'}: [identity] needs a name and an email, as ws sync reads it")
+    if identity and _git("config", "--local", "user.name", check=False).returncode:  # a global one doesn't count
         _git("config", "user.name", identity["name"])
         _git("config", "user.email", identity["email"])
     _git("config", "core.hooksPath", ".git/hooks")  # a global setting would skip the hook below
@@ -466,7 +521,7 @@ def _flagged_addresses(name: str) -> list[str]:
     text = _git("show", f":{name}").stdout
     flagged = []
     for number, line in enumerate(text.splitlines(), 1):
-        if any(not _ADDRESS_OK.fullmatch(m.group()) for m in _ADDRESS.finditer(line)):
+        if any(not _ADDRESS_OK.fullmatch(m.group().replace("-", ":")) for m in _ADDRESS.finditer(line)):
             flagged.append(f"FLAG  {name}  (an address at line {number})")
     return flagged
 
@@ -483,8 +538,8 @@ def scan() -> None:
         raise ToolError(f"the safety scan refused this, keep it in artifacts/ and name it by id:\n{words}")
 
 
-def lint_or_refuse(text: str, label: str) -> None:
-    problems = lint(text)
+def lint_or_refuse(text: str, label: str, only: set[str] | None = None) -> None:
+    problems = lint(text, only)
     if problems:
         raise ToolError("\n".join(f"{label}:{number}: {words}" for number, words in problems))
 
@@ -498,38 +553,111 @@ def hook() -> int:
     problems = []
     for name in _staged():
         if name.endswith(".md"):
-            problems += [f"{name}:{n}: {w}" for n, w in lint(_git("show", f":{name}").stdout)]
+            staged = _git("show", f":{name}").stdout
+            head = _git("show", f"HEAD:{name}", check=False)
+            only = entering(head.stdout if not head.returncode else None, staged)
+            problems += [f"{name}:{n}: {w}" for n, w in lint(staged, only)]
     if problems:
         raise ToolError("\n".join(problems))
     return 0
 
 
+def _drop(blob: str) -> None:
+    """Remove one loose object, which a write made and nothing refers to."""
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", blob):
+        (notes() / ".git" / "objects" / blob[:2] / blob[2:]).unlink(missing_ok=True)
+
+
+def _recover(path: Path, relative: str, temporary: Path, backup: Path, marker: Path) -> None:
+    """A write that was killed leaves its temporary file, its backup or the note of the blob it made.
+    Put the topic back as it was. The backup is the old file, and counts only if the new one never
+    got committed."""
+    if not any(left.exists() for left in (temporary, backup, marker)):
+        return
+    committed = False
+    if backup.exists():
+        if _git("diff", "--quiet", "HEAD", "--", relative, check=False).returncode:
+            os.replace(backup, path)
+        else:
+            backup.unlink()
+            committed = True
+    elif marker.exists() and path.exists() and _git("cat-file", "-e", f"HEAD:{relative}", check=False).returncode:
+        path.unlink()  # a new topic, killed after its file went in and before the commit
+    _git("reset", "-q", "--", relative, check=False)
+    if marker.exists():
+        if not committed:
+            _drop(marker.read_text().strip())
+        marker.unlink()
+    temporary.unlink(missing_ok=True)
+
+
 def write(topic: str, edit) -> None:
     """Edit, lint, scan and commit one topic under the lock. `edit` gets the text, returns the new
-    text. Any refusal leaves the file as it was, and nothing flagged stays in git's objects."""
+    text. The new text is scanned from git's index before the working file is touched, and the old file
+    is kept (a hard link, which takes no room) until the commit is in, so a refusal, a full disk or an
+    interrupt leaves the file as it was and nothing flagged in git's objects."""
     path = topic_path(topic)
     relative = str(path.relative_to(notes()))
+    temporary = path.with_name(f".{path.name}.new")
+    backup = path.with_name(f".{path.name}.back.new")
+    marker = path.with_name(f".{path.name}.blob.new")
     with locked(private_dir(notes()) / ".lock"):
         _ensure_repo()
-        before = path.read_text() if path.exists() else None
-        if before is not None:
-            lint_or_refuse(before, relative)
-        after = edit(before if before is not None else template(relative))
-        lint_or_refuse(after, relative)
         private_dir(path.parent)
-        temporary = path.with_name(f".{path.name}.new")
-        temporary.write_text(after)
-        temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        os.replace(temporary, path)
+        _recover(path, relative, temporary, backup, marker)
         try:
-            _git("add", "--", relative)
+            before = path.read_text() if path.exists() else None
+        except UnicodeDecodeError:
+            raise ToolError(f"{relative} isn't UTF-8 text, so nothing was written; notes lint reads it with the odd "
+                            "bytes replaced, and it needs fixing by hand") from None
+        if before is not None:
+            lint_or_refuse(before, relative, set())  # what was fine when it went in may have lost its artifact since
+        after = edit(before if before is not None else template(relative))
+        lint_or_refuse(after, relative, entering(before, after))
+        made = None  # the blob this write created, which only it may remove
+        replaced = committed = False
+        try:
+            temporary.write_text(after)
+            temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            blob = _git("hash-object", "--path", relative, "--", str(temporary)).stdout.strip()
+            if _git("cat-file", "-e", blob, check=False).returncode:
+                marker.write_text(blob)  # so a kill can't leave this object behind
+                made = blob
+                _git("hash-object", "-w", "--path", relative, "--", str(temporary))
+            _git("update-index", "--add", "--cacheinfo", f"100644,{blob},{relative}")
             scan()
+            if before is not None:
+                backup.unlink(missing_ok=True)
+                os.link(path, backup)
+            replaced = True
+            os.replace(temporary, path)
             _git("commit", "-q", "--no-verify", "-m", f"notes: {relative}", "--", relative)
-        except (ToolError, OSError, subprocess.TimeoutExpired) as e:
-            if before is None:
-                path.unlink()
-            else:
-                path.write_text(before)
-            _git("reset", "-q", "--", relative, check=False)
-            _git("prune", "--expire=now", check=False)
-            raise ToolError(f"nothing was written to {relative}. {e}") from None
+            committed = True
+            backup.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+        except BaseException as e:  # also an interrupt: the file and the index must come back
+            if committed:  # in already: only what's left to remove
+                backup.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+                raise
+            _undo(path, temporary, backup, marker, relative, made, before is not None, replaced)
+            if isinstance(e, (ToolError, OSError, subprocess.TimeoutExpired)):
+                raise ToolError(f"nothing was written to {relative}. {e}") from None
+            raise
+
+
+def _undo(path: Path, temporary: Path, backup: Path, marker: Path, relative: str, made: str | None,
+          existed: bool, replaced: bool) -> None:
+    """Every step runs even if another fails: this is the path a full disk or an interrupt takes."""
+    steps = [lambda: temporary.unlink(missing_ok=True),
+             lambda: marker.unlink(missing_ok=True),
+             lambda: _git("reset", "-q", "--", relative, check=False)]
+    if made:  # only the object this write made: a prune would take any other dangling one too
+        steps.append(lambda: _drop(made))
+    if replaced:
+        steps.insert(0, (lambda: os.replace(backup, path)) if existed else (lambda: path.unlink(missing_ok=True)))
+    for step in steps:
+        try:
+            step()
+        except (OSError, subprocess.TimeoutExpired):
+            pass

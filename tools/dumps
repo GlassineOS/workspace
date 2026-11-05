@@ -172,7 +172,7 @@ def add_gpu(a) -> int:
     log_is_new = False
     if logged:
         record["log"] = logged
-        _, log_is_new = artstore.add(a.log, "dumps", name=logged, cls="user-data", what=f"kernel log around GPU fault {own_id}",
+        _, log_is_new = artstore.add(a.log, "dumps", name=logged, cls="user-data", what="kernel log around a GPU fault",
                                      keep=a.keep, by=a.by, copy=True, extra={"dump": {"kind": "gpu-log"}})
     missing = [k for k in ("rbbm_status", "ib1_rem", "ring", "preempt_state") if k not in record and k not in said]
     what = f"GPU fault: {record.get('app', 'unknown app')} on {record.get('kernel', 'unknown kernel')}"

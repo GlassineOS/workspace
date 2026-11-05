@@ -173,6 +173,17 @@ def test_two_dumps_can_share_a_log(ws):
     assert record(ws, a)["dump"]["log"] == record(ws, b)["dump"]["log"] and len(log_entries(ws)) == 1
 
 
+def test_a_dump_and_its_log_with_a_date_can_both_go_after_it_dump_first(ws):
+    id_ = add(ws, "--keep", "2000-01-01", "--log", ws.file("dmesg", "x\n"))
+    e = record(ws, id_)
+    log = e["dump"]["log"]
+    expired = ws.art("find", "--expired").stdout
+    assert e["name"] in expired and log in expired
+    assert "referenced by artifact " + e["name"] in ws.art("rm", log, "--why", "x", code=1).stderr
+    ws.art("rm", e["name"], "--why", "its date passed")
+    ws.art("rm", log, "--why", "its date passed")
+
+
 def test_mesa_profile_and_what_ran_are_required(ws):
     path = write_dump(ws)
     for missing in (["--profile", "p", "--ran", "r"], ["--mesa", "m", "--ran", "r"], ["--mesa", "m", "--profile", "p"]):

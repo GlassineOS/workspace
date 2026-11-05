@@ -9,6 +9,7 @@
 !/Makefile
 !/README.md
 !/tests/
+!/tools/
 !/workspace.toml
 !/ws
 __pycache__/

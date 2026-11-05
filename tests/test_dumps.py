@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """The dump here is written by hand in the format's shape. No real dump is ever a test input in this repository."""
+import hashlib
 import json
 import os
 import stat
@@ -401,6 +402,34 @@ def test_a_second_image_can_join_a_stored_ram_log(ws):
     add_ram(ws)
     add_ram(ws, image="DDRCS1_0.BIN")
     assert sorted(e["dump"]["kind"] for e in manifest(ws)) == ["ram", "ram", "ram-log"]
+
+
+def test_a_file_named_twice_moves_nothing(ws):
+    ws.add("kernel-build")
+    image, klog = ws.file("J.BIN"), ws.file("klog", "x")
+    for images, log in (([image, image], klog), ([image, klog], klog)):
+        ws.tool("dumps", "add-ram", *images, "--build", "kernel-build", "--kernel-log", log, "--until", "2999-01-01", "--ran", "x", code=1)
+        assert image.exists() and klog.exists()
+    assert not (ws.artifacts / "dumps" / "manifest.jsonl").exists()
+
+
+def test_a_ram_dump_that_stops_partway_says_what_went_in_and_can_be_finished(ws):
+    ws.add("kernel-build", keep="always")
+    first, second = ws.file("A.BIN", "raw a\n"), ws.file("B.BIN", "raw b\n")
+    klog = ws.file("klog", "Booting Linux\n")
+    args = ("--build", "kernel-build", "--until", "2999-01-01", "--ran", "x")
+    sha = hashlib.sha256(b"raw b\n").hexdigest()[:12]
+    in_the_way = ws.artifacts / "dumps" / f"{sha}-ram-{sha}-B.BIN"  # the move onto a folder fails, as a full disk would
+    in_the_way.mkdir(parents=True)
+    err = ws.tool("dumps", "add-ram", first, second, "--kernel-log", klog, *args, code=1).stderr
+    log = next(e for e in manifest(ws) if e["dump"]["kind"] == "ram-log")
+    image = next(e for e in manifest(ws) if e["dump"]["kind"] == "ram")
+    assert f"stopped at {second}" in err and log["name"] in err and image["name"] in err
+    assert second.exists() and not first.exists() and not klog.exists()
+    in_the_way.rmdir()
+    ws.tool("dumps", "add-ram", second, "--kernel-log", ws.art("path", log["name"]).stdout.strip(), *args)
+    assert sorted(e["dump"]["kind"] for e in manifest(ws)) == ["ram", "ram", "ram-log"]
+    assert not second.exists()
 
 
 def test_a_stored_dump_is_read_only_and_the_folder_private(ws):

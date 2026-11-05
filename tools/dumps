@@ -202,6 +202,9 @@ def add_ram(a) -> int:
         if path.is_symlink() or not path.is_file():
             raise ToolError(f"not a regular file: {path}")
         artstore.check_name(path.name)
+    named = [path.resolve() for path in (*a.images, a.kernel_log)]
+    if len(set(named)) != len(named):
+        raise ToolError("a file is named twice: each image and the kernel log are stored once, and moved")
     if a.kernel_log.stat().st_size == 0:
         raise ToolError(f"{a.kernel_log} is empty: a RAM dump's kernel log is the part that's always kept")
     _, build = artstore.resolve(a.build)  # first, so nothing moves if it's unknown
@@ -223,11 +226,18 @@ def add_ram(a) -> int:
                             sources=[build["name"]], made=made, in_place=a.in_place, copy=a.copy,
                             extra={"dump": {"kind": "ram-log", **common}})
     print(f"{log['id']} {log['name']}: kept always" + ("" if new else f", already stored, {a.kernel_log} stays where it is"))
+    done = [log["name"]]
     for image, name in images:
-        entry, new = artstore.add(image, "dumps", name=name, cls="user-data",
-                                  what=f"raw RAM dump image {image.name}, build {build['name']}", keep=until, by=a.by,
-                                  sources=[build["name"], log["name"]], made=made, in_place=a.in_place, copy=a.copy,
-                                  extra={"dump": {"kind": "ram", **common, "log": log["name"]}})
+        try:
+            entry, new = artstore.add(image, "dumps", name=name, cls="user-data",
+                                      what=f"raw RAM dump image {image.name}, build {build['name']}", keep=until, by=a.by,
+                                      sources=[build["name"], log["name"]], made=made, in_place=a.in_place, copy=a.copy,
+                                      extra={"dump": {"kind": "ram", **common, "log": log["name"]}})
+        except (ToolError, OSError):
+            print(f"stopped at {image}. Already stored: {', '.join(done)}. To finish, name only what's left, with "
+                  f"--kernel-log \"$(art path {log['name']})\"", file=sys.stderr)
+            raise
+        done.append(entry["name"])
         print(f"{entry['id']} {entry['name']}: kept until {entry['keep']}" + ("" if new else f", already stored, {image} stays where it is"))
     return 0
 

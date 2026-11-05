@@ -22,8 +22,8 @@ stdout only, so don't save it in a repository.
 
 group fingerprints on RBBM status, IB1 rem, ring and preempt state, and names no cause. IB2 rem splits one
 bug across dumps, and a shader hash is inferred, so both are shown beside it, the hash as a candidate.
-Dumps within 30 s on one kernel, or --event-with, are linked as one event: a second recovery can blame
-an innocent process.
+Dumps within 30 s of each other on one known kernel, or --event-with, are linked as one event: a second recovery can
+blame an innocent process. No device is recorded, so two devices on one kernel at the same moment would still link.
 
 A RAM dump's kernel log is kept always and its raw images until a date: then `art find --expired` lists
 them and `art rm` removes them. It keeps its build, for the symbols, from being removed. Capturing one
@@ -127,13 +127,21 @@ def _event_for(a, record: dict, own_id: str) -> str:
         if other.get("dump", {}).get("kind") != "gpu":
             raise ToolError(f"{a.event_with} isn't a GPU dump")
         return other["dump"]["event"]
-    if record["time_from"] != "file date":
-        for other in _gpu_dumps():
-            d = other["dump"]
-            if (other["id"] != own_id and d["time_from"] != "file date" and d.get("kernel") == record.get("kernel")
-                    and abs(d["time"] - record["time"]) <= EVENT_WINDOW):
-                return d["event"]
-    return own_id
+    if record["time_from"] == "file date" or not record.get("kernel"):
+        return own_id
+    events: dict[str, list[dict]] = {}
+    for other in _gpu_dumps():
+        if other["id"] != own_id:
+            events.setdefault(other["dump"]["event"], []).append(other["dump"])
+    # A false link is worse than a missed one: nothing undoes it, and --event-with can always add one. So every dump of
+    # an event has a date and this kernel, and the whole event stays within the window: no chains, whatever the add order.
+    fits = []
+    for event, members in events.items():
+        times = [record["time"], *(d["time"] for d in members)]
+        if (max(times) - min(times) <= EVENT_WINDOW
+                and all(d["time_from"] != "file date" and d.get("kernel") == record["kernel"] for d in members)):
+            fits.append((min(abs(d["time"] - record["time"]) for d in members), event))
+    return min(fits)[1] if fits else own_id
 
 
 def _live(name: str) -> dict | None:

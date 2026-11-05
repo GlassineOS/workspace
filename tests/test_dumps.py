@@ -291,6 +291,53 @@ def test_dumps_close_in_time_are_one_event_and_a_link_can_be_named(ws):
     assert f"event {first}" in ws.tool("dumps", "group").stdout
 
 
+def no_kernel_dump(ws, name, *more):
+    path = ws.file(name, f"time: {TIME}\ncomm: {name}\n")
+    return ws.tool("dumps", "add", path, "--mesa", "26.0", "--profile", "p", "--ran", name, *more).stdout.split("\n")[0]
+
+
+def event_of(ws, id_):
+    return record(ws, id_)["dump"]["event"]
+
+
+def test_dumps_with_no_kernel_arent_linked_by_time(ws):
+    a, b = no_kernel_dump(ws, "devA"), no_kernel_dump(ws, "devB")
+    assert event_of(ws, a) == a and event_of(ws, b) == b
+
+
+def test_a_dump_with_a_kernel_isnt_linked_to_one_without(ws):
+    a = no_kernel_dump(ws, "devA")
+    b = add(ws)
+    assert event_of(ws, b) == b != a
+
+
+def test_a_given_kernel_counts_as_known(ws):
+    a = no_kernel_dump(ws, "devA", "--kernel", "7.0-test")
+    b = no_kernel_dump(ws, "devB", "--kernel", "7.0-test")
+    assert event_of(ws, b) == a
+
+
+def test_an_event_doesnt_chain_past_the_window(ws):
+    first = add(ws, name="a")
+    second = add(ws, name="b", time=TIME + 25)
+    third = add(ws, name="c", time=TIME + 50)
+    assert event_of(ws, second) == first and event_of(ws, third) == third
+
+
+def test_an_event_doesnt_stretch_past_the_window_when_added_out_of_order(ws):
+    middle = add(ws, name="a", time=TIME + 25)
+    early = add(ws, name="b")
+    late = add(ws, name="c", time=TIME + 50)
+    assert event_of(ws, early) == middle and event_of(ws, late) == late
+
+
+def test_a_dump_between_two_events_joins_the_nearer_one(ws):
+    far = add(ws, name="a")
+    near = add(ws, name="b", time=TIME + 31)
+    between = add(ws, name="c", time=TIME + 20)
+    assert event_of(ws, near) == near and event_of(ws, between) == near != far
+
+
 def test_event_with_must_be_a_gpu_dump(ws):
     ws.add("a.bin")
     add(ws, "--event-with", "a.bin", code=1)

@@ -5,7 +5,8 @@
   ws sync [REPO...]                clone what's missing, fetch the rest
   ws status [--json]               what's dirty, unpushed, and which task holds what
   ws new TASK REPO [REPO...]       work/TASK/REPO worktrees, on branch TASK (or --branch)
-  ws done TASK                     remove them; refuses while anything isn't pushed
+  ws done TASK [--drop-ignored]    remove them; refuses while anything isn't pushed, and past
+                                   1 MiB of ignored files unless told they can go
 
 Only ever touches main checkouts by fetching: their working trees stay as they are.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -21,6 +23,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+MAX_IGNORED = 1 << 20  # a few caches are fine. Anything more may be a result nobody meant to lose.
+SHOWN_IGNORED = 20
 
 
 class WsError(Exception):
@@ -28,7 +32,7 @@ class WsError(Exception):
 
 
 def git(*args, cwd=None, check=True) -> str:
-    done = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=None)
+    done = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, errors="surrogateescape", env=None)
     if check and done.returncode != 0:
         raise WsError(f"git {' '.join(args)}: {done.stderr.strip()}")
     return done.stdout.strip() if done.returncode == 0 else ""
@@ -55,6 +59,28 @@ def state(path: Path) -> dict:
     return {"path": str(path), "branch": git("rev-parse", "--abbrev-ref", "HEAD", cwd=path, check=False) or "?",
             "dirty": len(dirty.splitlines()),
             "unpushed": len(git("log", "--oneline", "HEAD", "--not", "--remotes", cwd=path, check=False).splitlines())}
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.lstat().st_size
+    except OSError:
+        return 0  # gone, or unreadable: it's still listed
+
+
+def ignored(path: Path) -> list[tuple[Path, int]]:
+    """Every ignored file in a checkout and its submodules, with its size. git status doesn't see these."""
+    found = []
+    for name in git("ls-files", "--others", "--ignored", "--exclude-standard", "-z", cwd=path).split("\0"):
+        if name.endswith("/"):  # a repository inside an ignored folder: git stops at its edge
+            for at, _, files in os.walk(path / name):
+                found += [(Path(at) / f, _size(Path(at) / f)) for f in files]
+        elif name:
+            found.append((path / name, _size(path / name)))
+    for line in git("ls-files", "--stage", "-z", cwd=path).split("\0"):
+        if line.startswith("160000 ") and (path / line.split("\t", 1)[1] / ".git").exists():
+            found += ignored(path / line.split("\t", 1)[1])
+    return found
 
 
 def status(root: Path) -> dict:
@@ -115,7 +141,11 @@ def new(root: Path, task: str, repos: list[str], branch: str | None, start: str 
         print(into)
 
 
-def done(root: Path, task: str) -> None:
+def _bytes(n: int) -> str:
+    return f"{n} B" if n < 1024 else f"{n // 1024} KiB" if n < 1 << 20 else f"{n / (1 << 20):.1f} MiB"
+
+
+def done(root: Path, task: str, drop_ignored: bool = False) -> None:
     if not _NAME.fullmatch(task):
         raise WsError(f"not a task name: {task}")
     directory = root / "work" / task
@@ -126,10 +156,23 @@ def done(root: Path, task: str) -> None:
     if held:
         lines = "\n".join(f"  {s['path']}: {s['dirty']} uncommitted, {s['unpushed']} unpushed" for s in held)
         raise WsError(f"not removing {task}, it holds work that isn't on GitHub:\n{lines}")
+    files = sorted((item for c in checkouts for item in ignored(c)), key=lambda item: -item[1])
+    total = sum(size for _, size in files)
+    if files:
+        lines = [f"  {_bytes(size):>10}  {path}" for path, size in files[:SHOWN_IGNORED]]
+        if len(files) > SHOWN_IGNORED:
+            lines.append(f"  and {len(files) - SHOWN_IGNORED} more")
+        print(f"{task}: {len(files)} ignored files, {_bytes(total)}, go with the worktree:\n" + "\n".join(lines))
+    if total > MAX_IGNORED and not drop_ignored:
+        raise WsError(f"not removing {task}: {_bytes(total)} of ignored files is past the limit of {_bytes(MAX_IGNORED)}. "
+                      "Keep what matters (art add), or --drop-ignored if they can all go")
     for c in checkouts:
         # git won't remove a worktree with a submodule unless forced. The check above is what guards it.
         git("worktree", "remove", "--force", str(c), cwd=c)
-    if not any(directory.iterdir()):
+    left = sorted(p.name for p in directory.iterdir())
+    if left:
+        print(f"left in {directory}, not part of a worktree: {', '.join(left)}")
+    else:
         directory.rmdir()
     print(f"{task}: removed")
 
@@ -154,7 +197,9 @@ def main(argv=None, root: Path = ROOT) -> int:
     n.add_argument("repos", nargs="+")
     n.add_argument("--branch")
     n.add_argument("--from", dest="start", help="start a new branch here instead of the default branch")
-    sub.add_parser("done").add_argument("task")
+    d = sub.add_parser("done")
+    d.add_argument("task")
+    d.add_argument("--drop-ignored", action="store_true", help="remove them even past the limit of ignored files")
     a = p.parse_args(argv)
     try:
         if a.command == "sync":
@@ -165,7 +210,7 @@ def main(argv=None, root: Path = ROOT) -> int:
         elif a.command == "new":
             new(root, a.task, a.repos, a.branch, a.start)
         else:
-            done(root, a.task)
+            done(root, a.task, a.drop_ignored)
     except WsError as e:
         print(f"ws: {e}", file=sys.stderr)
         return 1

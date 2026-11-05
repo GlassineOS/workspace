@@ -2,6 +2,8 @@
 """dev against a fake device: a folder, a stand-in for ssh that runs the script there with real mkdir
 and real sh, and its own clock, boot id and kernel log. Nothing here goes near a device."""
 import ast
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -217,6 +219,54 @@ def test_a_signal_during_the_command_still_releases(rig):
     p.send_signal(signal.SIGTERM)
     assert p.wait(SECONDS) == 128 + signal.SIGTERM
     assert not rig.device.lock.exists()
+
+
+@pytest.mark.parametrize("with_cmd", [True, False])
+def test_a_signal_while_the_first_report_is_sent_gives_the_lock_back(rig, hub, with_cmd):
+    rig.env["GLASSINE_HUB_SECONDS"] = "10"
+    h = hub(device_report="silent")  # the report takes its time: the lock is made and CMD has not started
+    ran = rig.tmp / "ran"
+    p = subprocess.Popen([sys.executable, str(TOOLS / "dev"), "take", "--as", "a", "--purpose", "p", "--expect", "5m",
+                          *(["--", "touch", str(ran)] if with_cmd else [])], env=rig.env, cwd=rig.tmp, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + SECONDS
+    while not h.reports() and time.time() < deadline:
+        time.sleep(0.02)
+    assert h.reports(), "the report never started"
+    p.send_signal(signal.SIGTERM)
+    _, err = p.communicate(timeout=SECONDS)
+    assert p.returncode == 128 + signal.SIGTERM and "Traceback" not in err, err
+    assert not ran.exists() and not rig.device.lock.exists()
+
+
+def load_dev():
+    loader = importlib.machinery.SourceFileLoader("dev_tool", str(TOOLS / "dev"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("dev_tool", loader))
+    loader.exec_module(module)
+    return module
+
+
+def test_a_signal_as_cmd_starts_waits_for_it_and_goes_on_to_it(monkeypatch):
+    dev = load_dev()
+    real = subprocess.Popen
+
+    def popen(*args, **kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)  # arrives before CMD exists, while dev's own handler is still in place
+        return real(*args, **kwargs)
+
+    def stop(signum, _frame):
+        raise dev.Stop(signum)
+
+    signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    saved = {s: signal.signal(s, stop) for s in signals}
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    try:
+        started = time.time()
+        assert dev.run_cmd(["sleep", "30"], after=signal.SIG_IGN) == 128 + signal.SIGTERM
+        assert time.time() - started < 10
+        assert all(signal.getsignal(s) == signal.SIG_IGN for s in signals)  # CMD is over: no handler can land before the release
+    finally:
+        for s, handler in saved.items():
+            signal.signal(s, handler)
 
 
 def test_a_device_gone_after_the_command_leaves_the_lock_and_says_so(rig):

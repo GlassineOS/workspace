@@ -285,7 +285,16 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
                 if path == target or (name in (_MANIFEST, ".lock") and path.is_relative_to(store)):
                     continue  # the manifests were read above, entry by entry
                 try:
-                    if not stat.S_ISREG(path.lstat().st_mode):  # never open a FIFO: it would block
+                    kind = path.lstat().st_mode
+                    if stat.S_ISLNK(kind):  # a link is a path: it refers to the file if its target does
+                        stats["files"] += 1
+                        if needles.search(os.fsencode(os.readlink(path))) or path.resolve() == target:
+                            hits.append(f"{path} (symlink)")
+                            if len(hits) >= limit:
+                                stats["stopped_at"] = limit
+                                return hits, stats
+                        continue
+                    if not stat.S_ISREG(kind):  # never open a FIFO: it would block
                         continue
                     found = _names_it(path, needles, overlap)
                 except OSError:

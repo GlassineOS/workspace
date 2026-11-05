@@ -383,3 +383,23 @@ def test_rm_names_the_files_it_couldnt_read_in_the_output_and_the_tombstone(ws):
         secret.chmod(0o600)
     t = entries(ws)[0]["tombstone"]
     assert t["search"]["unreadable"] == 1 and t["search"]["unreadable_paths"] == [str(secret)]
+
+
+def test_a_symlink_to_the_artifact_is_a_reference_and_is_never_opened(ws):
+    ws.add("a.bin")
+    target = ws.art("path", "a.bin").stdout.strip()
+    for link in (ws.old_tree / "current", ws.checkout / "pinned"):
+        link.symlink_to(target)
+        refuse(ws, "a.bin", f"{link} (symlink)")
+        link.unlink()
+    relative = ws.old_tree / "relative"
+    relative.symlink_to(os.path.relpath(target, ws.old_tree))
+    refuse(ws, "a.bin", f"{relative} (symlink)")
+    relative.unlink()
+    elsewhere = ws.tmp / "elsewhere"  # a link whose text doesn't name the file, but which leads to it
+    elsewhere.symlink_to(target)
+    (ws.old_tree / "hop").symlink_to(elsewhere)
+    refuse(ws, "a.bin", "hop (symlink)")
+    (ws.old_tree / "hop").unlink()
+    (ws.old_tree / "unrelated").symlink_to(ws.tmp / "nowhere")  # dangling, and nothing to do with it
+    ws.art("rm", "a.bin", "--why", "no link left")

@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Artifacts: files that aren't in a repository and must be found again.
+
+  art add FILE --to FOLDER --class C --what W --keep K   move it into artifacts/FOLDER and index it
+      [--in-place | --copy] [--name N] [--from X]... [--parent-base BASE] [--made WHEN] [--by WHO]
+  art find [WORDS...] [--folder F] [--class C] [--expired] [--all] [--json]
+  art path NAME|ID                                       the file's path; what tools and tests ask
+  art verify [NAME...]                                   hash files against the manifests
+  art rm NAME|ID --why WORDS [--dry-run] [--delete-in-place] [--retention-said NAME WORDS]
+
+FOLDER: dumps bases images captures bench vendor. C: ours vendor user-data derived.
+K: always, user, or a date (YYYY-MM-DD) until which it's kept.
+
+--in-place indexes a file where it is, without moving it. art rm of such an entry leaves the file
+unless --delete-in-place.
+
+art rm searches every checkout, worktree and the old tree for the id, name and path, and refuses on
+a hit, on keep: always or user, and before a keep date. It leaves a tombstone. Only the person
+overrides those: hub retention decisions don't exist yet, so for now --retention-said names the file
+and carries the person's words, which go in the tombstone. Nothing proves them, and an agent uses it
+only for words the person typed to it. Binary files aren't searched: a reference is text.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import artstore  # noqa: E402
+import wslib  # noqa: E402
+
+
+def size(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n} {unit}"
+        n //= 1024
+    return f"{n} TiB"
+
+
+def line(folder: str, e: dict) -> str:
+    state = f"REMOVED {e['tombstone']['when']}" if e.get("tombstone") else f"keep {e['keep']}"
+    return f"{e['id']}  {e['name']}  {folder}  {size(e['size'])}  {e['class']}  {state}  {e['what']}"
+
+
+def find(a) -> int:
+    today = date.today().isoformat()
+    for folder, e in artstore.everything():
+        text = json.dumps(e, ensure_ascii=False).lower()
+        if (a.folder and folder != a.folder) or (a.cls and e["class"] != a.cls):
+            continue
+        if e.get("tombstone") and not a.all:
+            continue
+        if a.expired and not (e["keep"][0].isdigit() and e["keep"] < today and not e.get("tombstone")):
+            continue
+        if all(word.lower() in text for word in a.words):
+            print(json.dumps({"folder": folder, **e}, ensure_ascii=False) if a.json else line(folder, e))
+    return 0
+
+
+def rm(a) -> int:
+    report = artstore.remove(a.ref, why=a.why, by=a.by, retention=tuple(a.retention_said) if a.retention_said else None,
+                             delete_in_place=a.delete_in_place, dry_run=a.dry_run)
+    stats = report["search"]
+    print(artstore.coverage(stats))
+    for reason in report["reasons"]:
+        print(f"  overriding: {reason}" if not a.dry_run else f"  {reason}")
+    name = report["entry"]["name"]
+    if a.dry_run:
+        print(f"{name}: nothing was changed")
+    else:
+        print(f"{name}: removed, file {report['entry']['tombstone']['file']}")
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="art", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    add = sub.add_parser("add")
+    add.add_argument("file", type=Path)
+    add.add_argument("--to", required=True, choices=artstore.FOLDERS)
+    add.add_argument("--class", dest="cls", required=True, choices=artstore.CLASSES)
+    add.add_argument("--what", required=True)
+    add.add_argument("--keep", required=True)
+    add.add_argument("--name")
+    add.add_argument("--from", dest="sources", action="append", default=[])
+    add.add_argument("--parent-base")
+    add.add_argument("--made")
+    add.add_argument("--by", default=getpass.getuser())
+    how = add.add_mutually_exclusive_group()
+    how.add_argument("--in-place", action="store_true")
+    how.add_argument("--copy", action="store_true")
+    f = sub.add_parser("find")
+    f.add_argument("words", nargs="*")
+    f.add_argument("--folder", choices=artstore.FOLDERS)
+    f.add_argument("--class", dest="cls", choices=artstore.CLASSES)
+    f.add_argument("--expired", action="store_true", help="live, with a keep date that has passed")
+    f.add_argument("--all", action="store_true", help="tombstones too")
+    f.add_argument("--json", action="store_true")
+    sub.add_parser("path").add_argument("ref")
+    sub.add_parser("verify").add_argument("refs", nargs="*")
+    r = sub.add_parser("rm")
+    r.add_argument("ref")
+    r.add_argument("--why", required=True)
+    r.add_argument("--by", default=getpass.getuser())
+    r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--delete-in-place", action="store_true")
+    r.add_argument("--retention-said", nargs=2, metavar=("NAME", "WORDS"))
+    a = p.parse_args(argv)
+    if a.command == "add":
+        entry, new = artstore.add(a.file, a.to, name=a.name, cls=a.cls, what=a.what, keep=a.keep, by=a.by,
+                                  sources=a.sources, parent_base=a.parent_base, made=a.made, in_place=a.in_place,
+                                  copy=a.copy)
+        print(f"{entry['id']} {entry['name']}" + ("" if new else f": already indexed, {a.file} stays where it is"))
+    elif a.command == "find":
+        return find(a)
+    elif a.command == "path":
+        print(artstore.path_of(a.ref))
+    elif a.command == "verify":
+        problems, unindexed = artstore.verify(a.refs)
+        for item in problems:
+            print(item)
+        for item in unindexed:
+            print(f"not indexed  {item}")
+        return 1 if problems else 0
+    else:
+        return rm(a)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(wslib.run("art", main))

@@ -1,0 +1,384 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""The artifact store: one manifest.jsonl per folder of artifacts/. An entry makes a file count.
+
+`art` is its command line, and `dumps` adds entries through it. docs/workspace.md in the hub is the
+design. Results and private data live here, on this host, and never in a repository.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import tomllib
+from datetime import date
+from pathlib import Path
+
+from wslib import ToolError, artifacts, home, locked, private_dir, utc
+
+FOLDERS = ("dumps", "bases", "images", "captures", "bench", "vendor")
+CLASSES = ("ours", "vendor", "user-data", "derived")
+ID_LENGTH = 12
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+_CHUNK = 1 << 20
+_MANIFEST = "manifest.jsonl"
+
+# Where `art rm` looks for references, in the order they're read. Paths starting with / or ~ have
+# to exist, or the search can't be trusted and rm refuses. Paths relative to the workspace may not
+# exist yet (notes/). A pattern only matches checkouts. Replaced by [art] search in workspace.toml,
+# or by GLASSINE_ART_PLACES (separated by colons), which is how tests inject it.
+DEFAULT_PLACES = (".", "*", "work/*/*", "artifacts", "notes", "~/BooxNoteAirHacking")
+_NEVER_READ = {".git", "__pycache__", ".pytest_cache", ".venv", "node_modules"}
+
+
+def check_keep(keep: str) -> str:
+    """always, user, or the date until which the file is kept."""
+    if keep in ("always", "user"):
+        return keep
+    try:
+        return date.fromisoformat(keep).isoformat()
+    except ValueError:
+        raise ToolError(f"keep is always, user or a date as YYYY-MM-DD, not {keep}") from None
+
+
+def _manifest(folder: str) -> Path:
+    return artifacts() / folder / _MANIFEST
+
+
+def read(folder: str) -> list[dict]:
+    path = _manifest(folder)
+    if not path.exists():
+        return []
+    entries = []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            raise ToolError(f"{path} line {number} isn't JSON: fix it by hand, nothing was changed") from None
+    return entries
+
+
+def _write(folder: str, entries: list[dict]) -> None:
+    path = _manifest(folder)
+    temporary = path.with_name(path.name + ".new")
+    with open(temporary, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def _lock():
+    return locked(private_dir(artifacts()) / ".lock")
+
+
+def everything() -> list[tuple[str, dict]]:
+    return [(folder, entry) for folder in FOLDERS for entry in read(folder)]
+
+
+def location(entry: dict) -> Path:
+    return Path(entry["path"]) if entry.get("in_place") else artifacts() / entry["path"]
+
+
+def resolve(ref: str) -> tuple[str, dict]:
+    """The live entry with this name or id. A removed one says when and why, rather than 'unknown'."""
+    known = everything()
+    live = [(f, e) for f, e in known if not e.get("tombstone")]
+    hits = [(f, e) for f, e in live if e["name"] == ref] or [(f, e) for f, e in live if ref in (e["id"], e["sha256"])]
+    if len(hits) > 1:
+        names = ", ".join(e["name"] for _, e in hits)
+        raise ToolError(f"{ref} is the same content under several names, use one: {names}")
+    if hits:
+        return hits[0]
+    gone = [e for _, e in known if ref in (e["name"], e["id"], e["sha256"])]
+    if gone:
+        t = gone[-1]["tombstone"]
+        raise ToolError(f"{ref} was removed {t['when']}: {t['why']}")
+    raise ToolError(f"no artifact {ref}")
+
+
+def path_of(ref: str) -> Path:
+    _, entry = resolve(ref)
+    path = location(entry)
+    if not path.is_file():
+        raise ToolError(f"{entry['name']} is indexed, but its file is missing: {path}")
+    return path
+
+
+def digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(_CHUNK):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _store(source: Path, into: Path, sha256: str, copy: bool) -> None:
+    """Put a file in the store, read-only. A move is a rename if it can be, and always ends verified."""
+    executable = source.stat().st_mode & stat.S_IXUSR
+    if not copy and source.stat().st_dev == into.parent.stat().st_dev:
+        os.rename(source, into)
+    else:
+        temporary = into.with_name(into.name + ".new")
+        shutil.copyfile(source, temporary)
+        if digest(temporary) != sha256:
+            temporary.unlink()
+            raise ToolError(f"copying {source} gave different content, nothing was stored")
+        os.rename(temporary, into)
+    into.chmod(0o500 if executable else 0o400)
+
+
+def add(source: Path, folder: str, *, name: str | None, cls: str, what: str, keep: str, by: str,
+        sources: list[str] = (), parent_base: str | None = None, made: str | None = None, in_place: bool = False,
+        copy: bool = False, extra: dict | None = None) -> tuple[dict, bool]:
+    """Index a file, moving it into the store unless told otherwise. Returns the entry, and whether it's new."""
+    source = Path(source)
+    if folder not in FOLDERS:
+        raise ToolError(f"not a folder of artifacts: {folder} (one of {', '.join(FOLDERS)})")
+    if cls not in CLASSES:
+        raise ToolError(f"not a class: {cls} (one of {', '.join(CLASSES)})")
+    if not what.strip():
+        raise ToolError("say what it is: what can't be empty")
+    keep = check_keep(keep)
+    name = name or source.name
+    if not _NAME.fullmatch(name):
+        raise ToolError(f"not a name: {name}")
+    if source.is_symlink() or not source.is_file():
+        raise ToolError(f"not a regular file: {source}")
+    source = source.resolve()
+    if in_place and source.is_relative_to((Path.home() / ".cache" / "glassine").resolve()):
+        raise ToolError("nothing may point into the build cache: anything may delete it")
+    sha256 = digest(source)
+    parent = resolve(parent_base)[1]["id"] if parent_base else None
+    entry = {"id": sha256[:ID_LENGTH], "name": name, "path": None, "sha256": sha256, "size": source.stat().st_size,
+             "class": cls, "what": what, "made": made or utc(source.stat().st_mtime), "by": by,
+             "from": list(sources), "keep": keep, "tombstone": None}
+    if parent:
+        entry["parent_base"] = parent
+    if in_place:
+        entry["in_place"] = True
+        entry["path"] = str(source)
+    else:
+        entry["path"] = f"{folder}/{entry['id']}-{name}"
+    if extra:
+        entry.update(extra)
+    private_dir(artifacts() / folder)
+    with _lock():
+        for _, other in everything():
+            if other["name"] == name and not other.get("tombstone"):
+                if other["sha256"] == sha256:
+                    return other, False
+                raise ToolError(f"the name {name} is taken by different content ({other['id']})")
+        if not in_place:
+            _store(source, artifacts() / entry["path"], sha256, copy)
+        _write(folder, read(folder) + [entry])
+    return entry, True
+
+
+def _expand(pattern: str, base: Path) -> list[Path]:
+    if pattern.startswith(("/", "~")):
+        path = Path(pattern).expanduser()
+        if not path.is_dir():
+            raise ToolError(f"can't search {path}: it isn't there, so no reference search can be trusted. "
+                            "If it's gone for good, take it out of [art] search in workspace.toml")
+        return [path]
+    if any(c in pattern for c in "*?["):
+        return sorted(p for p in base.glob(pattern) if (p / ".git").exists())
+    path = base / pattern
+    return [path] if path.is_dir() else []
+
+
+def places() -> list[Path]:
+    """Every folder `art rm` searches, from the injected list, the configured one, or the default."""
+    base = home()
+    injected = os.environ.get("GLASSINE_ART_PLACES")
+    if injected is not None:
+        patterns = [p for p in injected.split(os.pathsep) if p]
+    else:
+        config = base / "workspace.toml"
+        settings = tomllib.loads(config.read_text()) if config.exists() else {}
+        patterns = settings.get("art", {}).get("search", DEFAULT_PLACES)
+    found: dict[Path, None] = {}
+    for pattern in patterns:
+        for path in _expand(pattern, base):
+            found[path.resolve()] = None
+    return list(found)
+
+
+def _needles(entry: dict) -> re.Pattern:
+    """What counts as naming this file: its id or hash, its name or file name, or its path."""
+    names = {entry["name"], location(entry).name}
+    paths = {entry["path"], str(location(entry))}
+    try:
+        paths.add("~/" + str(location(entry).relative_to(Path.home())))
+    except ValueError:
+        pass
+    parts = [f"(?<![0-9a-fA-F]){re.escape(entry['id'])}"]
+    parts += [rf"(?<![\w.+-]){re.escape(n)}(?![\w+-]|\.\w)" for n in sorted(names)]
+    parts += [re.escape(p) for p in sorted(paths)]
+    return re.compile("|".join(parts).encode())
+
+
+def _mounts() -> set[str]:
+    """Other file systems inside a place (a mounted image, a chroot's /proc) aren't that place's files."""
+    try:
+        return {line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()}
+    except OSError:
+        return set()
+
+
+def _names_it(path: Path, needles: re.Pattern, overlap: int) -> bool | None:
+    """Whether a text file holds a needle. None if it's binary: a reference is text."""
+    with open(path, "rb") as f:
+        buffer = f.read(8192)
+        if b"\0" in buffer:
+            return None
+        while True:
+            if needles.search(buffer):
+                return True
+            more = f.read(_CHUNK)
+            if not more:
+                return False
+            buffer = buffer[-overlap:] + more
+
+
+def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
+    """What refers to this entry: other entries always, then every place. Stops once `limit` files hit."""
+    needles = _needles(entry)
+    hits = []
+    for other_folder, other in everything():
+        if other.get("tombstone") or (other_folder == folder and other["name"] == entry["name"]):
+            continue
+        if other.get("parent_base") == entry["id"]:
+            hits.append(f"artifact {other['name']}: parent_base")
+            continue
+        same_content = other["sha256"] == entry["sha256"]  # a twin under another name doesn't refer to this one
+        fields = {k: v for k, v in other.items() if not (same_content and k in ("id", "sha256", "path"))}
+        if needles.search(json.dumps(fields, ensure_ascii=False).encode()):
+            hits.append(f"artifact {other['name']}")
+    target = location(entry).resolve()
+    roots = places()
+    pruned = set(roots) | {home().resolve() / "work", home().resolve() / "artifacts", home().resolve() / "notes"}
+    pruned |= {Path(m) for m in _mounts()}
+    overlap = len(needles.pattern)
+    store = artifacts().resolve()
+    stats = {"places": [str(r) for r in roots], "files": 0, "binary": 0, "unreadable": 0}
+    for root in roots:
+        for directory, subdirs, files in os.walk(root, onerror=lambda _: stats.__setitem__("unreadable", stats["unreadable"] + 1)):
+            at = Path(directory)
+            subdirs[:] = [d for d in subdirs if d not in _NEVER_READ and at / d not in pruned]
+            for name in files:
+                path = at / name
+                if path == target or (name in (_MANIFEST, ".lock") and path.is_relative_to(store)):
+                    continue  # the manifests were read above, entry by entry
+                try:
+                    if not stat.S_ISREG(path.lstat().st_mode):  # never open a FIFO: it would block
+                        continue
+                    found = _names_it(path, needles, overlap)
+                except OSError:
+                    stats["unreadable"] += 1
+                    continue
+                stats["files"] += 1
+                if found is None:
+                    stats["binary"] += 1
+                elif found:
+                    hits.append(str(path))
+                    if len(hits) >= limit:
+                        stats["stopped_at"] = limit
+                        return hits, stats
+    return hits, stats
+
+
+def coverage(stats: dict) -> str:
+    """What a search read, in words, so a clear result isn't taken for more than it was."""
+    words = (f"searched {stats['files']} files in {len(stats['places'])} places: {stats['binary']} of them binary, "
+             f"not read for references, and {stats['unreadable']} more unreadable")
+    return words + (f"; stopped at {stats['stopped_at']} hits" if "stopped_at" in stats else "")
+
+
+def _protected(entry: dict) -> str | None:
+    keep = entry["keep"]
+    if keep in ("always", "user"):
+        return f"keep: {keep}"
+    if date.fromisoformat(keep) >= date.today():
+        return f"keep: until {keep}"
+    return None
+
+
+def remove(ref: str, *, why: str, by: str, retention: tuple[str, str] | None = None, delete_in_place: bool = False,
+           dry_run: bool = False) -> dict:
+    """Remove an artifact if nothing holds it, leaving a tombstone. Raises with the reasons if something does.
+
+    retention is (file named, the person's words): the stand-in for a recorded retention decision, until the
+    hub has them. Nothing proves the words. It lifts keep, references and changed content, not a failed search.
+    """
+    if not why.strip():
+        raise ToolError("say why: why can't be empty")
+    folder, entry = resolve(ref)
+    path = location(entry)
+    hits, stats = search(entry, folder)
+    reasons = [] if not (reason := _protected(entry)) else [reason]
+    reasons += [f"referenced by {hit}" for hit in hits]
+    present = path.is_file()
+    if present and digest(path) != entry["sha256"]:
+        reasons.append("its file no longer matches the manifest")
+    lifted = None
+    if retention:
+        named, words = retention
+        if named not in (entry["name"], entry["id"]):
+            raise ToolError(f"the retention names {named}, not this file ({entry['name']}, {entry['id']})")
+        if not words.strip():
+            raise ToolError("a retention carries the person's words: they can't be empty")
+        lifted = {"named": named, "words": words}
+    report = {"entry": entry, "reasons": reasons, "search": stats, "hits": hits}
+    if reasons and not lifted:
+        raise ToolError(f"not removing {entry['name']}, {coverage(stats)}:\n" + "\n".join(f"  {r}" for r in reasons) + "\n"
+                        f"It goes only with a retention decision naming it: --retention-said {entry['name']} \"the person's words\"")
+    if dry_run:
+        return report
+    with _lock():
+        entries = read(folder)
+        for stored in entries:
+            if stored["name"] == entry["name"] and not stored.get("tombstone"):
+                file = "was missing" if not present else "kept in place" if entry.get("in_place") and not delete_in_place else "deleted"
+                stored["tombstone"] = {"when": utc(), "by": by, "why": why, "retention": lifted, "overrode": reasons,
+                                       "search": stats, "file": file}
+                _write(folder, entries)
+                if file == "deleted":
+                    try:
+                        path.unlink()
+                    except OSError as e:
+                        raise ToolError(f"{entry['name']} has its tombstone, but its file is still there: {e}") from None
+                return {**report, "entry": stored}
+    raise ToolError(f"{entry['name']} was removed while this ran")
+
+
+def verify(refs: list[str]) -> tuple[list[str], list[str]]:
+    """Hash what's indexed. Returns problems, then files in the store nothing indexes (only with no refs)."""
+    if refs:
+        chosen = [resolve(r) for r in refs]
+    else:
+        chosen = [(f, e) for f, e in everything() if not e.get("tombstone")]
+    problems = []
+    for _, entry in chosen:
+        path = location(entry)
+        if not path.is_file():
+            problems.append(f"missing  {entry['name']}: {path}")
+        elif digest(path) != entry["sha256"]:
+            problems.append(f"changed  {entry['name']}: {path}")
+    unindexed = []
+    if not refs:
+        for folder in (artifacts(), *(artifacts() / f for f in FOLDERS)):
+            if folder.is_dir() and folder.stat().st_mode & 0o077:
+                problems.append(f"too open {folder}: should be mode 0700")
+        for folder in FOLDERS:
+            directory = artifacts() / folder
+            indexed = {e["path"] for e in read(folder)}
+            for f in sorted(directory.iterdir()) if directory.is_dir() else []:
+                if f.name != _MANIFEST and f"{folder}/{f.name}" not in indexed:
+                    unindexed.append(str(f))
+    return problems, unindexed

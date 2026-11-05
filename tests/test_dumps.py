@@ -284,8 +284,22 @@ def test_an_image_decoder_runs_in_a_container_with_no_network_and_read_only_moun
     fake_decoder(ws, "26.0", "--image", "alpine:test")
     out = ws.tool("dumps", "show", id_).stdout
     assert "--network none" in out and "--log-driver none" in out
-    assert ":/dump:ro" in out and ":/usr/local/bin/crashdec:ro" in out
+    assert "target=/dump,readonly" in out and "target=/usr/local/bin/crashdec,readonly" in out
     assert "alpine:test crashdec -f /dump" in out
+
+
+def test_a_path_with_a_colon_comma_or_space_stays_one_mount_value(ws, monkeypatch):
+    bin_dir = ws.tmp / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text('#!/bin/sh\nfor arg; do echo "[$arg]"; done\n')
+    docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    dump = write_dump(ws, "x:y z,w")
+    done = ws.tool("dumps", "add", dump, "--in-place", "--mesa", "26.0", "--profile", "p", "--ran", "x")
+    fake_decoder(ws, "26.0", "--image", "alpine:test")
+    out = ws.tool("dumps", "show", done.stdout.strip()).stdout
+    assert f'[type=bind,"source={dump}",target=/dump,readonly]' in out
 
 
 def test_group_fingerprints_and_keeps_ib2_and_shader_hash_out_of_it(ws):

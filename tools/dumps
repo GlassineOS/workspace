@@ -32,7 +32,9 @@ isn't here yet.
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
+import io
 import json
 import os
 import re
@@ -276,6 +278,13 @@ def _decoder(name: str) -> tuple[Path, str | None]:
     return Path(done.stdout.strip()), artstore.resolve(name)[1].get("decoder", {}).get("image")
 
 
+def _read_only(source: Path, target: str) -> str:
+    """A --mount value. Not -v, which splits on ":". --mount is CSV, so a comma in a path has to be quoted."""
+    field = io.StringIO()
+    csv.writer(field, lineterminator="").writerow(["type=bind", f"source={source}", f"target={target}", "readonly"])
+    return field.getvalue()
+
+
 def decode_command(dump: Path, decoder: Path, image: str | None, verbose: bool) -> list[str]:
     flags = ["-v"] if verbose else []
     if not image:
@@ -283,7 +292,7 @@ def decode_command(dump: Path, decoder: Path, image: str | None, verbose: bool) 
     # No network: a dump holds GPU memory from your apps. Mounted read-only, run as the files' owner. No log driver:
     # a daemon set to journald or syslog would otherwise keep the decoded output. Attached stdout still comes through.
     return ["docker", "run", "--rm", "--network", "none", "--log-driver", "none", "--user", f"{os.getuid()}:{os.getgid()}",
-            "-v", f"{dump}:/dump:ro", "-v", f"{decoder}:/usr/local/bin/crashdec:ro", image,
+            "--mount", _read_only(dump, "/dump"), "--mount", _read_only(decoder, "/usr/local/bin/crashdec"), image,
             "crashdec", *flags, "-f", "/dump"]
 
 

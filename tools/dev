@@ -19,7 +19,9 @@ current holder joins: it never releases or gives back, and a failed check fails 
 
 break is for a dead holder, only on the person's word. It keeps the old record in history.d.
 
---does needs a go. --go ID is asked of the hub, and with the hub down the answer is "unknown": refused.
+--does needs a go. --go ID is asked of the hub, and with the hub down the answer is "unknown": refused. A take that
+gets through spends a run of its go, and so does a join that names actions the lock doesn't hold yet; actions it holds
+cost nothing again.
 --go-said is for words the person typed to this session, in its live conversation, for its next lock:
 never a relay, a briefing or restored history. Compaction or Resume ends them. Nothing proves them,
 so they go in the lock record, with the actions.
@@ -284,7 +286,10 @@ def join(a, cmd, config, device, st) -> int:
               f"dev release --as {a.name}", file=sys.stderr)
     held = [x for x in lock.get("does", "").split(",") if x]
     new = [x for x in a.actions if x not in held]
-    go_table(new, a, config)
+    # A join that adds actions spends a run, as a take that names them does: else a go for one run would cover every lock
+    # that is taken bare and joined. It's asked before the write, as a join can't give the lock back: a refusal after the
+    # write would leave actions on the lock that no go covers. The cost is a run if that one write then fails.
+    go_table(new, a, config, spend=True)
     steps = []
     if new:
         steps.append(put("lock.d/does", ",".join(held + new)))

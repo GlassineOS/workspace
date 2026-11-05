@@ -843,8 +843,22 @@ def test_the_hub_is_asked_after_the_device_check_so_a_dirty_device_spends_no_go(
     assert not [r for r in h.seen if r["op"].startswith("decision")]
 
 
+def test_a_join_with_new_actions_spends_a_run_and_actions_already_on_the_lock_dont(rig, hub):
+    h = hub(decision_use=HUB_YES)
+    rig.take("a")  # no actions, so nothing asked and nothing spent
+    for _ in range(3):
+        rig.dev("take", "--as", "a", "--purpose", "step", "--does", "reboot", "--go", "7", "--", "true")
+    asked = [r["op"] for r in h.seen if r["op"].startswith("decision")]
+    assert asked == ["decision.holding", "decision.use"]  # the lock now covers reboot: once
+    rig.dev("take", "--as", "a", "--purpose", "step", "--does", "suspend", "--go", "7", "--", "true")
+    [first, second] = spends(h)
+    assert (first["actions"], second["actions"], second["id"], second["agent_token"]) == (["reboot"], ["suspend"], "7", "tool-token")
+    assert not [r for r in h.seen if r["op"] == "decision.check"]
+    assert rig.device.field("does") == "reboot,suspend"
+
+
 def test_a_join_with_new_actions_goes_through_the_table_keeping_the_lock(rig, hub):
-    hub(decision_check=HUB_NO)
+    hub(decision_use=HUB_NO)
     rig.take("a", "--does", "reboot", "--go-said", "reboot it")
     made = rig.device.field("made")
     assert "name a go" in rig.dev("take", "--as", "a", "--purpose", "more", "--does", "suspend", code=1).stderr

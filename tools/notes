@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Notes: what's known, per topic, with where each claim comes from. Local, on this host only.
+
+  notes add AREA/TOPIC WORDS [PROVENANCE] [--open]      a line in Log as things happen, or an Open item
+  notes set AREA/TOPIC WORDS PROVENANCE [--replaces cN] [--open]
+                                                        a claim in Current (or Open), in place of cN
+  notes set AREA/TOPIC --retract cN --by cM --why WORDS mark it retracted; it moves to Log, what rests
+                                                        on it leaves Current with it
+  notes set AREA/TOPIC --close cN --why WORDS           an Open item that's settled goes to Log
+  notes lint [AREA/TOPIC...]                            what may not stand; exit 1 if anything
+  notes find WORDS... [--limit N] [--json]              search notes and the configured sources
+
+PROVENANCE: --seen "base=ID, art=NAME" or --seen "base=ID, cmd=WORDS", --inferred c12[,c13], --guess,
+--user, --archive [SOURCE]. A Log line may have none.
+
+Current takes only seen with evidence, user, and inferred resting on a Current claim, so a guess or
+an archive claim stays in Open or Log. Nothing is deleted: what's replaced, retracted or closed goes
+to Log, marked.
+
+add and set take a lock around edit, lint, the safety scan and commit, and refuse the whole write on
+a problem. A pre-commit hook gives hand edits the same scan and lint. The scan catches patterns, not
+prose or decoded output, so what's private stays in artifacts/, named by id.
+
+find says current, open, history, retracted or "archive, unreviewed" on every row, and current ranks
+first. Its index is in ~/.cache/glassine/notes-index, mode 0700. It searches notes only until
+workspace.toml names more:
+
+  [[notes.source]]
+  name = "memory"             # the word each row shows
+  path = "~/some/folder"      # relative paths start at the workspace
+  kind = "text"               # text (paragraphs) or transcripts (.jsonl, one message a line)
+  glob = "**/*.md"            # optional; the kind sets the default
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import noteslib  # noqa: E402
+import notesindex  # noqa: E402
+import wslib  # noqa: E402
+
+
+def provenance(p: argparse.ArgumentParser) -> None:
+    how = p.add_mutually_exclusive_group()
+    how.add_argument("--seen", metavar="EVIDENCE")
+    how.add_argument("--inferred", metavar="IDS")
+    how.add_argument("--guess", action="store_true")
+    how.add_argument("--user", action="store_true")
+    how.add_argument("--archive", nargs="?", const="", metavar="SOURCE")
+
+
+def tag(a) -> str | None:
+    if a.seen is not None:
+        return f"seen: {a.seen}"
+    if a.inferred is not None:
+        return f"inferred: {a.inferred}"
+    if a.archive is not None:
+        return f"archive: {a.archive}" if a.archive else "archive"
+    return "guess" if a.guess else "user" if a.user else None
+
+
+def one_line(words: str) -> str:
+    return " ".join(words.split())
+
+
+def add(a) -> int:
+    made: list[str | None] = []
+
+    def edit(text: str) -> str:
+        new, claim = noteslib.add(text, one_line(a.words), tag(a), open_item=a.open)
+        made.append(claim)
+        return new
+
+    noteslib.write(a.topic, edit)
+    print(" ".join(word for word in (a.topic, made[0]) if word))
+    return 0
+
+
+def set_(a) -> int:
+    said = []
+
+    def edit(text: str) -> str:
+        if a.retract:
+            if not a.by or not a.why:
+                raise wslib.ToolError("--retract needs --by cN, the claim that shows it wrong, and --why WORDS")
+            new, out = noteslib.retract(text, a.retract, a.by, one_line(a.why))
+            said.append(f"{a.topic} {a.retract} retracted")
+        elif a.close:
+            if not a.why:
+                raise wslib.ToolError("--close needs --why WORDS")
+            new, out = noteslib.close(text, a.close, one_line(a.why)), []
+            said.append(f"{a.topic} {a.close} closed")
+        else:
+            if not a.words or not tag(a):
+                raise wslib.ToolError("set needs words and provenance: --seen, --inferred, --user, or --guess with --open")
+            new, claim, out = noteslib.set_claim(text, one_line(a.words), tag(a), replaces=a.replaces, open_item=a.open)
+            said.append(f"{a.topic} {claim}")
+        if out:
+            said.append(f"out of Current with it: {' '.join(out)}")
+        return new
+
+    noteslib.write(a.topic, edit)
+    print("\n".join(said))
+    return 0
+
+
+def lint(a) -> int:
+    paths = [noteslib.topic_path(topic) for topic in a.topics] or noteslib.topics()
+    bad = 0
+    for path in paths:
+        if not path.exists():
+            raise wslib.ToolError(f"no such topic: {path.relative_to(wslib.notes())}")
+        relative = path.relative_to(wslib.notes())
+        problems = noteslib.lint(path.read_text(errors="replace"))
+        if len(relative.parts) != 2:
+            problems.insert(0, (1, "a topic lives at AREA/TOPIC.md"))
+        for number, words in problems:
+            print(f"{relative}:{number}: {words}")
+        bad += bool(problems)
+    print(f"{len(paths)} topics, {bad} with problems", file=sys.stderr)
+    return 1 if bad else 0
+
+
+def find(a) -> int:
+    warnings: list[str] = []
+    rows, total = notesindex.find(a.words, a.limit, warnings.append)
+    for row in rows:
+        if a.json:
+            print(json.dumps(row, ensure_ascii=False))
+        else:
+            print("  ".join(word for word in (row["state"], row["where"], row["label"], row["text"]) if word))
+    names = ["notes", *(source["name"] for source in notesindex.sources())]
+    for warning in warnings:
+        print(f"notes: {warning}", file=sys.stderr)
+    more = f", showing {len(rows)}: --limit for more" if total > len(rows) else ""
+    print(f"{total} rows from {', '.join(names)}{more}", file=sys.stderr)
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="notes", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    a_ = sub.add_parser("add")
+    a_.add_argument("topic")
+    a_.add_argument("words")
+    a_.add_argument("--open", action="store_true")
+    provenance(a_)
+    s = sub.add_parser("set")
+    s.add_argument("topic")
+    s.add_argument("words", nargs="?")
+    s.add_argument("--open", action="store_true")
+    s.add_argument("--replaces", metavar="ID")
+    s.add_argument("--retract", metavar="ID")
+    s.add_argument("--close", metavar="ID")
+    s.add_argument("--by", metavar="ID")
+    s.add_argument("--why")
+    provenance(s)
+    sub.add_parser("lint").add_argument("topics", nargs="*")
+    f = sub.add_parser("find")
+    f.add_argument("words", nargs="+")
+    f.add_argument("--limit", type=int, default=20)
+    f.add_argument("--json", action="store_true")
+    sub.add_parser("hook", help=argparse.SUPPRESS)
+    a = p.parse_args(argv)
+    if a.command == "hook":
+        return noteslib.hook()
+    return {"add": add, "set": set_, "lint": lint, "find": find}[a.command](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(wslib.run("notes", main))

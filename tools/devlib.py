@@ -413,9 +413,9 @@ def hub_ask(request: dict) -> dict | None:
     return reply if isinstance(reply, dict) and reply.get("ok") else None
 
 
-def hub_says(actions: list[str], go: str | None, device: str) -> tuple[str, str]:
-    """Ask about a go: ("yes" or "no" or "unknown", the hub's words)."""
-    reply = hub_ask({"op": "decision.check", "agent_token": os.environ.get("GLASSINE_HUB_MCP_TOKEN"), "kind": "go",
+def hub_says(actions: list[str], go: str | None, device: str, spend: bool = False) -> tuple[str, str]:
+    """Ask about a go: ("yes" or "no" or "unknown", the hub's words). With spend, a yes uses up a run of it."""
+    reply = hub_ask({"op": "decision.use" if spend else "decision.check", "agent_token": os.environ.get("GLASSINE_HUB_MCP_TOKEN"), "kind": "go",
                      "id": go, "actions": actions, "target": device})
     if reply is None or reply.get("answer") not in ("yes", "no"):
         return "unknown", "the hub didn't answer"

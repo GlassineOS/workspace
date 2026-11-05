@@ -44,6 +44,12 @@ def check_keep(keep: str) -> str:
         raise ToolError(f"keep is always, user or a date as YYYY-MM-DD, not {keep}") from None
 
 
+def check_name(name: str) -> str:
+    if not _NAME.fullmatch(name):
+        raise ToolError(f"not a name: {name}")
+    return name
+
+
 def _manifest(folder: str) -> Path:
     return artifacts() / folder / _MANIFEST
 
@@ -198,9 +204,7 @@ def add(source: Path, folder: str, *, name: str | None, cls: str, what: str, kee
     if not what.strip():
         raise ToolError("say what it is: what can't be empty")
     keep = check_keep(keep)
-    name = name or source.name
-    if not _NAME.fullmatch(name):
-        raise ToolError(f"not a name: {name}")
+    name = check_name(name or source.name)
     if source.is_symlink() or not source.is_file():
         raise ToolError(f"not a regular file: {source}")
     source = source.resolve()

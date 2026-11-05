@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -57,4 +58,10 @@ def run(prog: str, main, argv=None) -> int:
         return main(argv) or 0
     except (ToolError, OSError) as e:
         print(f"{prog}: {e}", file=sys.stderr)
+        return 1
+    except subprocess.TimeoutExpired as e:
+        print(f"{prog}: {Path(str(e.cmd[0])).name if e.cmd else 'a command'} did not finish in {e.timeout:g} s", file=sys.stderr)
+        return 1
+    except UnicodeError as e:  # a file or an argument that isn't text in the encoding it was read as
+        print(f"{prog}: not valid text: {e}", file=sys.stderr)
         return 1

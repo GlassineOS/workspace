@@ -53,16 +53,16 @@ A5XX_CP_IB1_BUFSZ = 0xb21
 A5XX_CP_IB2_BUFSZ = 0xb24
 _HEADER = re.compile(r"(kernel|time|comm|cmdline|revision|rbbm-status): (.*)")
 _REGISTER = re.compile(r"\s+- \{ offset: 0x([0-9a-f]+), value: 0x([0-9a-f]+) \}")
-_PREEMPT = re.compile(r"\bcur rb (\d+), next rb \d+, preempt state (\d+)")
-_LOCKUP = re.compile(r"\blockup rb (\d+)")
+# Wording read from the kernel's source, not from a captured log. The kernel prints -1 for "no such ring".
+_PREEMPT = re.compile(r"\bnext rb -?\d+, preempt state (-?\d+)")
+# The ring the kernel blames. `cur rb` on the preempt line isn't it: that line prints before the kernel corrects it.
+_BLAMED = re.compile(r"\b(?:gpu fault ring|lockup rb) (-?\d+)")
 
 
 def _kernel_says(line: str, found: dict) -> None:
-    if m := _PREEMPT.search(line):
-        found.setdefault("ring", int(m[1]))
-        found.setdefault("preempt_state", int(m[2]))
-    elif m := _LOCKUP.search(line):
-        found.setdefault("ring", int(m[1]))
+    for field, pattern in (("ring", _BLAMED), ("preempt_state", _PREEMPT)):
+        if (m := pattern.search(line)) and (value := int(m[1])) >= 0:
+            found.setdefault(field, value)
 
 
 def parse_dump(path: Path) -> dict:

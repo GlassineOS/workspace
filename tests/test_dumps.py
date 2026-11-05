@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 
 TIME = 1800000000.5
+# Written from the kernel's format strings, not captured on a device.
+PREEMPT_LINE = "a5xx: hang detect: hw rb {hw} (CP_RB_BASE 1000), cur rb {cur}, next rb {next}, preempt state {state}\n"
+BLAME_LINE = "a5xx: hw is on rb {ring}, not rb {cur}: blaming rb {ring}\n"
+FAULT_LINE = "gpu fault ring {ring} fence 1a status 00000000 rb 0010/0020 ib1 0000000000001000/0020 ib2 0000000000002000/0010\n"
 
 
 def dump_text(rbbm="0x12345678", ib1=0x20, ib2=0x10, comm="app", kernel="7.0-test", time=TIME, revision="509 (05000900)"):
@@ -60,7 +64,8 @@ def fake_decoder(ws, mesa="26.0", *more):
 
 
 def test_add_stores_a_fault_with_what_the_dump_says_and_what_it_cant(ws):
-    id_ = add(ws, "--log", ws.file("dmesg", "hw rb 2, cur rb 2, next rb 0, preempt state 3\n"))
+    log = PREEMPT_LINE.format(hw=2, cur=2, next=-1, state=3) + FAULT_LINE.format(ring=2)
+    id_ = add(ws, "--log", ws.file("dmesg", log))
     e = record(ws, id_)
     d = e["dump"]
     assert (d["kernel"], d["app"], d["time"], d["time_from"]) == ("7.0-test", "app", TIME, "dump")
@@ -71,6 +76,30 @@ def test_add_stores_a_fault_with_what_the_dump_says_and_what_it_cant(ws):
     assert Path(ws.art("path", id_).stdout.strip()).is_relative_to(ws.artifacts / "dumps")
     assert (ws.tmp / "dmesg").exists()  # the log may cover a second dump of the event
     assert ws.art("path", d["log"]).stdout
+
+
+def logged(ws, text):
+    return record(ws, add(ws, "--log", ws.file("dmesg", text)))["dump"]
+
+
+def test_a_preempt_line_with_no_next_ring_still_gives_the_preempt_state(ws):
+    d = logged(ws, PREEMPT_LINE.format(hw=1, cur=-1, next=-1, state=2))
+    assert d["preempt_state"] == 2 and "ring" not in d
+
+
+def test_the_ring_is_the_one_the_kernel_blames_not_cur_rb(ws):
+    d = logged(ws, PREEMPT_LINE.format(hw=1, cur=0, next=1, state=2) + BLAME_LINE.format(ring=1, cur=0) + FAULT_LINE.format(ring=1))
+    assert (d["ring"], d["preempt_state"]) == (1, 2)
+
+
+def test_a_lockup_names_the_ring(ws):
+    assert logged(ws, "a5xx: hangcheck detected gpu lockup rb 3!\n")["ring"] == 3
+
+
+def test_a_ring_of_minus_one_is_unknown(ws):
+    d = logged(ws, FAULT_LINE.format(ring=-1))
+    assert "ring" not in d
+    assert "ring=unknown" in ws.tool("dumps", "group").stdout
 
 
 def test_mesa_profile_and_what_ran_are_required(ws):

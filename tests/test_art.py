@@ -11,7 +11,7 @@ import wslib
 
 
 def entries(ws, folder="bases"):
-    return [json.loads(line) for line in (ws.artifacts / folder / "manifest.jsonl").read_text().splitlines()]
+    return [json.loads(line) for line in (ws.artifacts / folder / "manifest.jsonl").read_text().split("\n") if line]
 
 
 def test_add_moves_the_file_in_with_a_full_entry(ws):
@@ -324,3 +324,14 @@ def test_the_repository_tracks_tools_and_ignores_results():
         return subprocess.run(["git", "check-ignore", "-q", path], cwd=repo).returncode == 0
     assert not ignored("tools/art") and not ignored("tests/test_art.py")
     assert ignored("artifacts/dumps/x") and ignored("notes/x.md") and ignored("work/x/y")
+
+
+def test_line_separator_characters_survive_the_manifest(ws):
+    words = "pasted text and\x85more"
+    ws.art("add", ws.file("a.bin"), "--to", "bases", "--class", "ours", "--what", words, "--keep", "user")
+    ws.add("b.bin")  # a second command still reads the manifest
+    assert entries(ws)[0]["what"] == words
+    assert "a.bin" in ws.art("find", "pasted").stdout
+    ws.art("rm", "b.bin", "--why", "room\x85now")
+    assert ws.art("verify").stdout == ""
+    assert entries(ws)[1]["tombstone"]["why"] == "room\x85now"

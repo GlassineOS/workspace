@@ -52,7 +52,10 @@ def read(folder: str) -> list[dict]:
     if not path.exists():
         return []
     entries = []
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    # Split on "\n" only: splitlines() also splits on U+2028, U+2029 and U+0085, which _write leaves raw.
+    for number, line in enumerate(path.read_text().split("\n"), 1):
+        if not line:
+            continue
         try:
             entries.append(json.loads(line))
         except json.JSONDecodeError:

@@ -495,7 +495,7 @@ def test_a_file_that_vanishes_before_the_delete_is_recorded_as_missing(ws, monke
 
     monkeypatch.setattr(Path, "unlink", vanish)
     report = artstore.remove("a.bin", why="x", by="me")
-    monkeypatch.undo()
+    monkeypatch.setattr(Path, "unlink", real)
     assert report["entry"]["tombstone"]["file"] == "was missing" and not path.exists()
     assert entries(ws)[0]["tombstone"]["file"] == "was missing"
 
@@ -505,3 +505,50 @@ def test_a_re_added_name_doesnt_make_its_old_tombstone_look_undeleted(ws):
     ws.art("rm", "a.bin", "--why", "x")
     ws.add("a.bin", content="same\n")  # same id and name, so the same path in the store
     assert ws.art("verify").stdout == ""
+
+
+def during_the_search(monkeypatch, action):
+    """Run action once the places have been searched, before rm takes the lock: where a long search leaves a gap."""
+    real = artstore.search
+
+    def search(*args, **kwargs):
+        found = real(*args, **kwargs)
+        monkeypatch.setattr(artstore, "search", real)  # once
+        action()
+        return found
+
+    monkeypatch.setattr(artstore, "search", search)
+
+
+def test_a_delta_added_while_rm_searches_still_holds_its_parent(ws, monkeypatch):
+    ws.add("base.img")
+    delta = ws.file("delta.img", "delta\n")
+    during_the_search(monkeypatch, lambda: artstore.add(
+        delta, "bases", name=None, cls="derived", what="x", keep="user", by="me", parent_base="base.img"))
+    with pytest.raises(wslib.ToolError, match="artifact delta.img: parent_base"):
+        artstore.remove("base.img", why="x", by="me")
+    assert ws.art("path", "base.img").stdout and entries(ws)[0]["tombstone"] is None
+
+
+def test_the_same_gap_lets_a_retention_through_and_records_what_it_overrode(ws, monkeypatch):
+    ws.add("base.img")
+    delta = ws.file("delta.img", "delta\n")
+    during_the_search(monkeypatch, lambda: artstore.add(
+        delta, "bases", name=None, cls="derived", what="x", keep="user", by="me", parent_base="base.img"))
+    report = artstore.remove("base.img", why="x", by="me", retention=("base.img", "yes, that one"))
+    assert report["entry"]["tombstone"]["overrode"] == ["referenced by artifact delta.img: parent_base"]
+
+
+def test_a_name_that_changed_content_while_rm_searched_is_not_removed(ws, monkeypatch):
+    ws.add("a.bin", content="one\n")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+
+    def replace():
+        artstore.remove("a.bin", why="first", by="other")
+        artstore.add(ws.file("a.bin", "two\n"), "bases", name=None, cls="derived", what="x", keep="2000-01-01", by="other")
+
+    during_the_search(monkeypatch, replace)
+    with pytest.raises(wslib.ToolError, match="replaced while this ran"):
+        artstore.remove("a.bin", why="second", by="me")
+    assert entries(ws)[1]["tombstone"] is None and not path.exists()
+    assert Path(ws.art("path", "a.bin").stdout.strip()).read_text() == "two\n"

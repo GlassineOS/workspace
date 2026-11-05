@@ -163,12 +163,9 @@ def add(source: Path, folder: str, *, name: str | None, cls: str, what: str, kee
     if in_place and source.is_relative_to((Path.home() / ".cache" / "glassine").resolve()):
         raise ToolError("nothing may point into the build cache: anything may delete it")
     sha256 = digest(source)
-    parent = resolve(parent_base)[1]["id"] if parent_base else None
     entry = {"id": sha256[:ID_LENGTH], "name": name, "path": None, "sha256": sha256, "size": source.stat().st_size,
              "class": cls, "what": what, "made": made or utc(source.stat().st_mtime), "by": by,
              "from": list(sources), "keep": keep, "tombstone": None}
-    if parent:
-        entry["parent_base"] = parent
     if in_place:
         entry["in_place"] = True
         entry["path"] = str(source)
@@ -178,6 +175,8 @@ def add(source: Path, folder: str, *, name: str | None, cls: str, what: str, kee
         entry.update(extra)
     private_dir(artifacts() / folder)
     with _lock():
+        if parent_base:  # under the lock, so `art rm` can't remove the parent between this check and the entry
+            entry["parent_base"] = resolve(parent_base)[1]["id"]
         for _, other in everything():
             if other["name"] == name and not other.get("tombstone"):
                 if other["sha256"] == sha256:
@@ -256,9 +255,8 @@ def _names_it(path: Path, needles: re.Pattern, overlap: int) -> bool | None:
             buffer = buffer[-overlap:] + more
 
 
-def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
-    """What refers to this entry: other entries always, then every place. Stops once `limit` files hit."""
-    needles = _needles(entry)
+def _artifact_hits(entry: dict, folder: str, needles: re.Pattern) -> list[str]:
+    """The other live entries that refer to this one: by parent_base, or by naming it in a field."""
     hits = []
     for other_folder, other in everything():
         if other.get("tombstone") or (other_folder == folder and other["name"] == entry["name"]):
@@ -270,6 +268,13 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
         fields = {k: v for k, v in other.items() if not (same_content and k in ("id", "sha256", "path"))}
         if needles.search(json.dumps(fields, ensure_ascii=False).encode()):
             hits.append(f"artifact {other['name']}")
+    return hits
+
+
+def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
+    """What refers to this entry: other entries always, then every place. Stops once `limit` files hit."""
+    needles = _needles(entry)
+    hits = _artifact_hits(entry, folder, needles)
     target = location(entry).resolve()
     roots = places()
     pruned = set(roots) | {home().resolve() / "work", home().resolve() / "artifacts", home().resolve() / "notes"}
@@ -335,6 +340,11 @@ def _protected(entry: dict) -> str | None:
     return None
 
 
+def _refusal(entry: dict, stats: dict, reasons: list[str]) -> str:
+    return (f"not removing {entry['name']}, {coverage(stats)}:\n" + "\n".join(f"  {r}" for r in reasons) + "\n"
+            f"It goes only with a retention decision naming it: --retention-said {entry['name']} \"the person's words\"")
+
+
 def remove(ref: str, *, why: str, by: str, retention: tuple[str, str] | None = None, delete_in_place: bool = False,
            dry_run: bool = False) -> dict:
     """Remove an artifact if nothing holds it, leaving a tombstone. Raises with the reasons if something does.
@@ -368,14 +378,24 @@ def remove(ref: str, *, why: str, by: str, retention: tuple[str, str] | None = N
         lifted = {"named": named, "words": words}
     report = {"entry": entry, "reasons": reasons, "search": stats, "hits": hits}
     if reasons and not lifted:
-        raise ToolError(f"not removing {entry['name']}, {coverage(stats)}:\n" + "\n".join(f"  {r}" for r in reasons) + "\n"
-                        f"It goes only with a retention decision naming it: --retention-said {entry['name']} \"the person's words\"")
+        raise ToolError(_refusal(entry, stats, reasons))
     if dry_run:
         return report
     with _lock():
         entries = read(folder)
         for stored in entries:
-            if stored["name"] == entry["name"] and not stored.get("tombstone"):
+            if stored["name"] == entry["name"] and stored["sha256"] == entry["sha256"] and not stored.get("tombstone"):
+                # The search of places ran without the lock and can take minutes. What the manifests say can be
+                # checked again now, so an `art add --parent-base` that landed meanwhile still holds the file.
+                present = path.is_file()
+                again = [] if not (reason := _protected(stored)) else [reason]
+                again += [f"referenced by {hit}" for hit in _artifact_hits(stored, folder, _needles(stored))]
+                if present and digest(path) != stored["sha256"]:
+                    again.append("its file no longer matches the manifest")
+                new = [r for r in again if r not in reasons]
+                if new and not lifted:
+                    raise ToolError(_refusal(entry, stats, new))
+                reasons.extend(new)  # report and tombstone carry what was overridden
                 file = "was missing" if not present else "kept in place" if entry.get("in_place") and not delete_in_place else "deleted"
                 tombstone = {"when": utc(), "by": by, "why": why, "retention": lifted, "overrode": reasons,
                              "search": stats, "file": "deleting" if file == "deleted" else file}
@@ -395,7 +415,7 @@ def remove(ref: str, *, why: str, by: str, retention: tuple[str, str] | None = N
                         tombstone["file"] = "deleted"
                     _write(folder, entries)
                 return {**report, "entry": stored}
-    raise ToolError(f"{entry['name']} was removed while this ran")
+    raise ToolError(f"{entry['name']} was removed or replaced while this ran, nothing was changed")
 
 
 def verify(refs: list[str]) -> tuple[list[str], list[str]]:

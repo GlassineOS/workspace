@@ -711,3 +711,16 @@ def test_verify_reports_a_file_it_cant_read_and_carries_on(ws):
         (ws.old_tree / "one.bin").chmod(0o600)
     assert "unreadable  one.bin" in done.stdout and "changed  three.bin" in done.stdout and "Traceback" not in done.stderr
     assert "two.bin" not in done.stdout
+
+
+def test_the_files_skipped_as_binary_are_named_in_the_output_and_the_tombstone(ws):
+    ws.add("a.bin")
+    utf16 = ws.old_tree / "notes16.txt"
+    utf16.write_bytes("see a.bin\n".encode("utf-16"))  # text, but with NULs
+    logged = ws.old_tree / "run.log"
+    logged.write_bytes(b"a.bin\0\n")
+    out = ws.art("rm", "a.bin", "--why", "x", "--dry-run").stdout
+    assert "2 of them binary" in out
+    assert f"skipped as binary: {utf16}" in out and f"skipped as binary: {logged}" in out
+    ws.art("rm", "a.bin", "--why", "x")
+    assert sorted(entries(ws)[0]["tombstone"]["search"]["binary_paths"]) == sorted([str(utf16), str(logged)])

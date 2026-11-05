@@ -19,7 +19,8 @@ art rm searches every checkout, worktree and the old tree for the id, name and p
 a hit, on keep: always or user, and before a keep date. It leaves a tombstone. Only the person
 overrides those: the hub doesn't record retention decisions, so --retention-said names the file
 and carries the person's words, which go in the tombstone. Nothing proves them, and an agent uses it
-only for words the person typed to it. Binary files aren't searched: a reference is text.
+only for words the person typed to it. Files with a NUL in their first 8 KiB aren't searched (a
+reference is text), and rm lists them: a UTF-16 file is one.
 """
 from __future__ import annotations
 
@@ -71,6 +72,11 @@ def rm(a) -> int:
     print(artstore.coverage(stats))
     for path in stats["unreadable_paths"]:
         print(f"  not read: {path}")
+    for path in stats["binary_paths"]:
+        print(f"  skipped as binary: {path}")
+    skipped = stats["binary"] - len(stats["binary_paths"])
+    if skipped > 0:
+        print(f"  and {skipped} more skipped as binary")
     for reason in report["reasons"]:
         print(f"  overriding: {reason}" if not a.dry_run else f"  {reason}")
     name = report["entry"]["name"]

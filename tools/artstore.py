@@ -305,7 +305,11 @@ def _mounts() -> set[str]:
 
 
 def _names_it(path: Path, needles: re.Pattern, overlap: int) -> bool | None:
-    """Whether a text file holds a needle. None if it's binary: a reference is text."""
+    """Whether a text file holds a needle. None if it has a NUL in its first 8 KiB: a reference is text.
+
+    That also skips UTF-16 files and logs with a stray NUL, which are text. They are listed by name in the
+    output and the tombstone (`binary_paths`), so a clear result says what it didn't read.
+    """
     with open(path, "rb") as f:
         buffer = f.read(8192)
         if b"\0" in buffer:
@@ -345,7 +349,7 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
     overlap = len(needles.pattern)
     store = artifacts().resolve()
     stats = {"places": [str(r) for r in roots], "files": 0, "binary": 0, "unreadable": 0, "unreadable_paths": [],
-             "unlistable": []}
+             "binary_paths": [], "unlistable": []}
 
     def unlistable(error: OSError) -> None:
         stats["unlistable"].append(f"{error.filename}: {error.strerror}")
@@ -379,6 +383,8 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
                 stats["files"] += 1
                 if found is None:
                     stats["binary"] += 1
+                    if len(stats["binary_paths"]) < _LISTED:
+                        stats["binary_paths"].append(str(path))
                 elif found:
                     hits.append(str(path))
                     if len(hits) >= limit:

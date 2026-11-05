@@ -306,6 +306,48 @@ def test_a_ram_dump_with_a_bad_image_name_moves_nothing(ws):
     assert image.exists() and klog.exists()
 
 
+def add_ram(ws, *more, until="2999-01-01", build="kernel-build", image="DDRCS0_0.BIN", log="Booting Linux\n", code=0):
+    return ws.tool("dumps", "add-ram", ws.file(image, f"raw {image}\n"), "--build", build, "--kernel-log", ws.file("klog", log),
+                   "--until", until, "--ran", "froze overnight", *more, code=code)
+
+
+def test_adding_a_ram_dump_again_with_the_same_date_and_build_changes_nothing_and_says_so(ws):
+    ws.add("kernel-build", keep="always")
+    add_ram(ws)
+    before = manifest(ws)
+    out = add_ram(ws).stdout
+    assert out.count("already stored") == 2 and "kept until 2999-01-01" in out
+    assert manifest(ws) == before and (ws.tmp / "DDRCS0_0.BIN").exists() and (ws.tmp / "klog").exists()
+
+
+@pytest.mark.parametrize("change", [{"until": "2000-01-01"}, {"build": "other-build"}, {"log": "another log\n"}])
+def test_adding_a_ram_image_again_with_another_date_build_or_log_is_refused(ws, change):
+    ws.add("kernel-build", keep="always")
+    ws.add("other-build", keep="always")
+    add_ram(ws)
+    before = manifest(ws)
+    err = add_ram(ws, **change, code=1).stderr
+    assert "already stored" in err and "kernel-build" in err and "nothing was changed" in err
+    assert manifest(ws) == before and (ws.tmp / "DDRCS0_0.BIN").exists() and (ws.tmp / "klog").exists()
+
+
+def test_a_ram_log_stored_with_another_build_is_refused_for_a_new_image(ws):
+    ws.add("kernel-build", keep="always")
+    ws.add("other-build", keep="always")
+    add_ram(ws)
+    before = manifest(ws)
+    err = add_ram(ws, build="other-build", image="DDRCS1_0.BIN", code=1).stderr
+    assert "already stored with build kernel-build" in err
+    assert manifest(ws) == before and (ws.tmp / "DDRCS1_0.BIN").exists()
+
+
+def test_a_second_image_can_join_a_stored_ram_log(ws):
+    ws.add("kernel-build", keep="always")
+    add_ram(ws)
+    add_ram(ws, image="DDRCS1_0.BIN")
+    assert sorted(e["dump"]["kind"] for e in manifest(ws)) == ["ram", "ram", "ram-log"]
+
+
 def test_a_stored_dump_is_read_only_and_the_folder_private(ws):
     id_ = add(ws)
     assert stat.S_IMODE(Path(ws.art("path", id_).stdout.strip()).stat().st_mode) == 0o400

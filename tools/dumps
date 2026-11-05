@@ -136,6 +136,10 @@ def _event_for(a, record: dict, own_id: str) -> str:
     return own_id
 
 
+def _live(name: str) -> dict | None:
+    return next((e for _, e in artstore.everything() if e["name"] == name and not e.get("tombstone")), None)
+
+
 def add_gpu(a) -> int:
     if not a.file.is_file():
         raise ToolError(f"not a file: {a.file}")
@@ -185,7 +189,7 @@ def add_gpu(a) -> int:
 
 
 def add_ram(a) -> int:
-    artstore.check_keep(a.until)
+    until = artstore.check_keep(a.until)
     for path in (*a.images, a.kernel_log):
         if path.is_symlink() or not path.is_file():
             raise ToolError(f"not a regular file: {path}")
@@ -196,19 +200,27 @@ def add_ram(a) -> int:
     given = _when(a.time)
     made = wslib.utc(given) if given is not None else None
     log_id = artstore.digest(a.kernel_log)[:artstore.ID_LENGTH]
+    log_name = f"ram-{log_id}-kernel.log"
+    images = [(image, f"ram-{artstore.digest(image)[:artstore.ID_LENGTH]}-{image.name}") for image in a.images]
+    # What's stored stands: asking for another date or build is refused here, or it would look as if it had worked.
+    if (stored := _live(log_name)) and stored["dump"]["build"] != build["name"]:
+        raise ToolError(f"{log_name} is already stored with build {stored['dump']['build']}, not {build['name']}: nothing was changed")
+    for _, name in images:
+        if (stored := _live(name)) and (stored["keep"], stored["dump"]["build"], stored["dump"]["log"]) != (until, build["name"], log_name):
+            raise ToolError(f"{name} is already stored, kept until {stored['keep']} with build {stored['dump']['build']} and log "
+                            f"{stored['dump']['log']}, and add-ram can't change those: nothing was changed")
     common = {"kernel": a.kernel, "ran": a.ran, "build": build["name"], "event": log_id, "time": given}
-    log, _ = artstore.add(a.kernel_log, "dumps", name=f"ram-{log_id}-kernel.log", cls="user-data",
-                          what=f"kernel log of a RAM dump, build {build['name']}", keep="always", by=a.by,
-                          sources=[build["name"]], made=made, in_place=a.in_place, copy=a.copy,
-                          extra={"dump": {"kind": "ram-log", **common}})
-    print(f"{log['id']} {log['name']}: kept always")
-    for image in a.images:
-        sha = artstore.digest(image)[:artstore.ID_LENGTH]
-        entry, _ = artstore.add(image, "dumps", name=f"ram-{sha}-{image.name}", cls="user-data",
-                                what=f"raw RAM dump image {image.name}, build {build['name']}", keep=a.until, by=a.by,
-                                sources=[build["name"], log["name"]], made=made, in_place=a.in_place, copy=a.copy,
-                                extra={"dump": {"kind": "ram", **common, "log": log["name"]}})
-        print(f"{entry['id']} {entry['name']}: kept until {a.until}")
+    log, new = artstore.add(a.kernel_log, "dumps", name=log_name, cls="user-data",
+                            what=f"kernel log of a RAM dump, build {build['name']}", keep="always", by=a.by,
+                            sources=[build["name"]], made=made, in_place=a.in_place, copy=a.copy,
+                            extra={"dump": {"kind": "ram-log", **common}})
+    print(f"{log['id']} {log['name']}: kept always" + ("" if new else f", already stored, {a.kernel_log} stays where it is"))
+    for image, name in images:
+        entry, new = artstore.add(image, "dumps", name=name, cls="user-data",
+                                  what=f"raw RAM dump image {image.name}, build {build['name']}", keep=until, by=a.by,
+                                  sources=[build["name"], log["name"]], made=made, in_place=a.in_place, copy=a.copy,
+                                  extra={"dump": {"kind": "ram", **common, "log": log["name"]}})
+        print(f"{entry['id']} {entry['name']}: kept until {entry['keep']}" + ("" if new else f", already stored, {image} stays where it is"))
     return 0
 
 

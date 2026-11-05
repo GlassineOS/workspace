@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
+import errno
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
+
+import pytest
 
 import artstore
 import wslib
 
 
 def entries(ws, folder="bases"):
-    return [json.loads(line) for line in (ws.artifacts / folder / "manifest.jsonl").read_text().splitlines()]
+    return [json.loads(line) for line in (ws.artifacts / folder / "manifest.jsonl").read_text().split("\n") if line]
 
 
 def test_add_moves_the_file_in_with_a_full_entry(ws):
@@ -219,8 +225,8 @@ def test_a_delta_needs_a_known_parent(ws):
     assert path.exists()
 
 
-def test_parent_base_holds_even_with_no_places_to_search(ws, monkeypatch):
-    monkeypatch.setenv("GLASSINE_ART_PLACES", "")
+def test_parent_base_holds_even_when_no_file_in_the_places_names_it(ws, monkeypatch):
+    monkeypatch.setenv("GLASSINE_ART_PLACES", str(ws.old_tree))
     ws.add("base.img")
     ws.add("delta.img", "--parent-base", "base.img")
     refuse(ws, "base.img", "parent_base")
@@ -324,3 +330,424 @@ def test_the_repository_tracks_tools_and_ignores_results():
         return subprocess.run(["git", "check-ignore", "-q", path], cwd=repo).returncode == 0
     assert not ignored("tools/art") and not ignored("tests/test_art.py")
     assert ignored("artifacts/dumps/x") and ignored("notes/x.md") and ignored("work/x/y")
+
+
+def test_line_separator_characters_survive_the_manifest(ws):
+    words = "pasted text and\x85more"
+    ws.art("add", ws.file("a.bin"), "--to", "bases", "--class", "ours", "--what", words, "--keep", "user")
+    ws.add("b.bin")  # a second command still reads the manifest
+    assert entries(ws)[0]["what"] == words
+    assert "a.bin" in ws.art("find", "pasted").stdout
+    ws.art("rm", "b.bin", "--why", "room\x85now")
+    assert ws.art("verify").stdout == ""
+    assert entries(ws)[1]["tombstone"]["why"] == "room\x85now"
+
+
+needs_permissions = pytest.mark.skipif(os.geteuid() == 0, reason="root reads what mode 000 hides")
+
+
+@needs_permissions
+def test_rm_refuses_when_a_folder_cant_be_listed_even_with_a_retention(ws):
+    ws.add("a.bin")
+    (ws.old_tree / "sub").mkdir()
+    (ws.old_tree / "sub" / "ref.txt").write_text("a.bin\n")
+    (ws.old_tree / "sub").chmod(0o000)
+    try:
+        err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+        assert "couldn't be listed" in err and str(ws.old_tree / "sub") in err
+        assert "couldn't be listed" in ws.art("rm", "a.bin", "--why", "x", "--dry-run", code=1).stderr
+        assert "couldn't be listed" in ws.art("rm", "a.bin", "--why", "x", "--retention-said", "a.bin", "yes", code=1).stderr
+        assert entries(ws)[0]["tombstone"] is None
+    finally:
+        (ws.old_tree / "sub").chmod(0o700)
+    ws.art("rm", "a.bin", "--why", "x", "--dry-run", code=1)  # the reference is found once it can be read
+
+
+@needs_permissions
+def test_rm_refuses_when_a_whole_place_cant_be_listed(ws):
+    ws.add("a.bin")
+    (ws.old_tree / "ref.txt").write_text("a.bin\n")
+    ws.old_tree.chmod(0o000)
+    try:
+        assert "couldn't be listed" in ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    finally:
+        ws.old_tree.chmod(0o700)
+
+
+@needs_permissions
+def test_rm_names_the_files_it_couldnt_read_in_the_output_and_the_tombstone(ws):
+    ws.add("a.bin")
+    secret = ws.old_tree / "root-owned.log"
+    secret.write_text("a.bin\n")
+    secret.chmod(0o000)
+    try:
+        out = ws.art("rm", "a.bin", "--why", "x").stdout
+        assert "1 more unreadable" in out and f"not read: {secret}" in out
+    finally:
+        secret.chmod(0o600)
+    t = entries(ws)[0]["tombstone"]
+    assert t["search"]["unreadable"] == 1 and t["search"]["unreadable_paths"] == [str(secret)]
+
+
+def test_a_symlink_to_the_artifact_is_a_reference_and_is_never_opened(ws):
+    ws.add("a.bin")
+    target = ws.art("path", "a.bin").stdout.strip()
+    for link in (ws.old_tree / "current", ws.checkout / "pinned"):
+        link.symlink_to(target)
+        refuse(ws, "a.bin", f"{link} (symlink)")
+        link.unlink()
+    relative = ws.old_tree / "relative"
+    relative.symlink_to(os.path.relpath(target, ws.old_tree))
+    refuse(ws, "a.bin", f"{relative} (symlink)")
+    relative.unlink()
+    elsewhere = ws.tmp / "elsewhere"  # a link whose text doesn't name the file, but which leads to it
+    elsewhere.symlink_to(target)
+    (ws.old_tree / "hop").symlink_to(elsewhere)
+    refuse(ws, "a.bin", "hop (symlink)")
+    (ws.old_tree / "hop").unlink()
+    (ws.old_tree / "unrelated").symlink_to(ws.tmp / "nowhere")  # dangling, and nothing to do with it
+    ws.art("rm", "a.bin", "--why", "no link left")
+
+
+def elsewhere_device(ws):
+    """A temporary folder on another file system than the workspace, or skip."""
+    for candidate in ("/dev/shm", "/run/user/%d" % os.getuid(), "/var/tmp"):
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK) and os.stat(candidate).st_dev != ws.tmp.stat().st_dev:
+            return Path(tempfile.mkdtemp(dir=candidate))
+    pytest.skip("no writable folder on another file system")
+
+
+def test_a_move_across_file_systems_leaves_no_source_behind(ws):
+    other = elsewhere_device(ws)
+    try:
+        src = other / "c.bin"
+        src.write_text("across\n")
+        src.chmod(0o755)
+        ws.art("add", src, "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user")
+        assert not src.exists()
+        stored = Path(ws.art("path", "c.bin").stdout.strip())
+        assert stored.read_text() == "across\n" and os.access(stored, os.X_OK)
+        assert ws.art("verify").stdout == ""
+        copied = other / "d.bin"
+        copied.write_text("kept\n")
+        ws.art("add", copied, "--copy", "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user")
+        assert copied.exists()
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+@needs_permissions
+def test_a_move_that_cant_remove_its_source_stores_nothing(ws):
+    other = elsewhere_device(ws)
+    try:
+        src = other / "c.bin"
+        src.write_text("stuck\n")
+        other.chmod(0o500)  # the original can be copied but not removed
+        err = ws.art("add", src, "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user", code=1).stderr
+        assert "can't be removed" in err
+        assert src.exists() and entries(ws) == []
+        assert ws.art("verify").stdout == ""  # no store copy left behind
+    finally:
+        other.chmod(0o700)
+        shutil.rmtree(other, ignore_errors=True)
+
+
+def write_entries(ws, folder, rows):
+    (ws.artifacts / folder / "manifest.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+@needs_permissions
+def test_a_delete_that_fails_says_so_in_the_tombstone_and_verify_flags_the_file(ws):
+    src = ws.old_tree / "stuck.bin"
+    src.write_text("stuck")
+    ws.art("add", src, "--in-place", "--to", "vendor", "--class", "vendor", "--what", "x", "--keep", "2000-01-01")
+    ws.old_tree.chmod(0o500)  # the file can be read but not unlinked
+    try:
+        err = ws.art("rm", "stuck.bin", "--why", "x", "--delete-in-place", code=1).stderr
+        assert "still there" in err
+        t = entries(ws, "vendor")[0]["tombstone"]
+        assert t["file"] == "delete failed" and t["error"]
+        out = ws.art("verify", code=1).stdout
+        assert "still there  stuck.bin" in out and "delete failed" in out
+    finally:
+        ws.old_tree.chmod(0o700)
+    src.unlink()
+    assert ws.art("verify").stdout == ""
+
+
+def test_verify_flags_a_tombstone_left_between_the_write_and_the_unlink(ws):
+    ws.add("a.bin")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+    row = entries(ws)[0]
+    row["tombstone"] = {"when": "2000-01-01T00:00:00Z", "by": "me", "why": "x", "retention": None, "overrode": [],
+                        "search": {}, "file": "deleting"}
+    write_entries(ws, "bases", [row])
+    out = ws.art("verify", code=1).stdout
+    assert f"still there  a.bin: {path}" in out and "deleting" in out
+
+
+def test_a_file_that_vanishes_before_the_delete_is_recorded_as_missing(ws, monkeypatch):
+    ws.add("a.bin")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+    real = Path.unlink
+
+    def vanish(self, *args, **kwargs):
+        real(self, *args, **kwargs)
+        raise FileNotFoundError(self)
+
+    monkeypatch.setattr(Path, "unlink", vanish)
+    report = artstore.remove("a.bin", why="x", by="me")
+    monkeypatch.setattr(Path, "unlink", real)
+    assert report["entry"]["tombstone"]["file"] == "was missing" and not path.exists()
+    assert entries(ws)[0]["tombstone"]["file"] == "was missing"
+
+
+def test_a_re_added_name_doesnt_make_its_old_tombstone_look_undeleted(ws):
+    ws.add("a.bin", content="same\n")
+    ws.art("rm", "a.bin", "--why", "x")
+    ws.add("a.bin", content="same\n")  # same id and name, so the same path in the store
+    assert ws.art("verify").stdout == ""
+
+
+def during_the_search(monkeypatch, action):
+    """Run action once the places have been searched, before rm takes the lock: where a long search leaves a gap."""
+    real = artstore.search
+
+    def search(*args, **kwargs):
+        found = real(*args, **kwargs)
+        monkeypatch.setattr(artstore, "search", real)  # once
+        action()
+        return found
+
+    monkeypatch.setattr(artstore, "search", search)
+
+
+def test_a_delta_added_while_rm_searches_still_holds_its_parent(ws, monkeypatch):
+    ws.add("base.img")
+    delta = ws.file("delta.img", "delta\n")
+    during_the_search(monkeypatch, lambda: artstore.add(
+        delta, "bases", name=None, cls="derived", what="x", keep="user", by="me", parent_base="base.img"))
+    with pytest.raises(wslib.ToolError, match="artifact delta.img: parent_base"):
+        artstore.remove("base.img", why="x", by="me")
+    assert ws.art("path", "base.img").stdout and entries(ws)[0]["tombstone"] is None
+
+
+def test_the_same_gap_lets_a_retention_through_and_records_what_it_overrode(ws, monkeypatch):
+    ws.add("base.img")
+    delta = ws.file("delta.img", "delta\n")
+    during_the_search(monkeypatch, lambda: artstore.add(
+        delta, "bases", name=None, cls="derived", what="x", keep="user", by="me", parent_base="base.img"))
+    report = artstore.remove("base.img", why="x", by="me", retention=("base.img", "yes, that one"))
+    assert report["entry"]["tombstone"]["overrode"] == ["referenced by artifact delta.img: parent_base"]
+
+
+def test_a_name_that_changed_content_while_rm_searched_is_not_removed(ws, monkeypatch):
+    ws.add("a.bin", content="one\n")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+
+    def replace():
+        artstore.remove("a.bin", why="first", by="other")
+        artstore.add(ws.file("a.bin", "two\n"), "bases", name=None, cls="derived", what="x", keep="2000-01-01", by="other")
+
+    during_the_search(monkeypatch, replace)
+    with pytest.raises(wslib.ToolError, match="replaced while this ran"):
+        artstore.remove("a.bin", why="second", by="me")
+    assert entries(ws)[1]["tombstone"] is None and not path.exists()
+    assert Path(ws.art("path", "a.bin").stdout.strip()).read_text() == "two\n"
+
+
+def leftovers(ws):
+    return sorted(str(p.relative_to(ws.artifacts)) for p in ws.artifacts.rglob("*.new"))
+
+
+def test_a_what_that_isnt_utf8_is_refused_before_anything_moves(ws):
+    src = ws.file("a.bin")
+    done = subprocess.run([sys.executable, str(Path(artstore.__file__).parent / "art"), "add", str(src), "--to", "bases",
+                           "--class", "ours", "--keep", "user", "--what", b"caf\xe9"], capture_output=True)
+    assert done.returncode == 1 and b"UTF-8" in done.stderr and b"Traceback" not in done.stderr
+    assert src.exists() and leftovers(ws) == []
+    assert not [p for p in (ws.artifacts / "bases").iterdir() if p.name != "manifest.jsonl"]
+    ws.art("verify")
+
+
+def test_a_full_disk_while_writing_the_entry_moves_nothing(ws, monkeypatch):
+    src = ws.file("a.bin")
+
+    def full(_):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(OSError, match="No space"):
+        artstore.add(src, "bases", name=None, cls="ours", what="x", keep="user", by="me")
+    assert src.exists() and leftovers(ws) == [] and artstore.read("bases") == []
+    assert not [p for p in (ws.artifacts / "bases").iterdir()]
+
+
+def test_a_failed_move_takes_the_entry_out_again_and_leaves_the_source(ws, monkeypatch):
+    ws.add("kept.bin")
+    before = (ws.artifacts / "bases" / "manifest.jsonl").read_text()
+    src = ws.file("a.bin")
+
+    def full(*_):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(artstore, "_store", full)
+    with pytest.raises(OSError, match="No space"):
+        artstore.add(src, "bases", name=None, cls="ours", what="x", keep="user", by="me")
+    assert src.exists() and (ws.artifacts / "bases" / "manifest.jsonl").read_text() == before
+
+
+def test_a_copy_that_runs_out_of_room_leaves_no_partial_file_in_the_store(ws, monkeypatch):
+    other = elsewhere_device(ws)
+    try:
+        src = other / "big.bin"
+        src.write_text("data\n")
+
+        def partial(source, target):
+            Path(target).write_text("da")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(artstore.shutil, "copyfile", partial)
+        with pytest.raises(OSError):
+            artstore.add(src, "bases", name=None, cls="ours", what="x", keep="user", by="me")
+        assert src.exists() and leftovers(ws) == [] and artstore.read("bases") == []
+        assert not [p for p in (ws.artifacts / "bases").iterdir() if p.name != "manifest.jsonl"]
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+def test_a_why_that_isnt_utf8_deletes_nothing(ws):
+    ws.add("a.bin")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+    done = subprocess.run([sys.executable, str(Path(artstore.__file__).parent / "art"), "rm", "a.bin", "--why", b"caf\xe9"],
+                          capture_output=True)
+    assert done.returncode == 1 and b"UTF-8" in done.stderr
+    assert path.exists() and entries(ws)[0]["tombstone"] is None and leftovers(ws) == []
+
+
+def test_a_root_doesnt_hide_the_work_folders_and_artifacts_below_it(ws, monkeypatch):
+    ws.add("a.bin")
+    monkeypatch.setenv("GLASSINE_ART_PLACES", str(ws.home))  # only the workspace itself, as the reviewer ran it
+    ref = ws.checkout / "ref.txt"
+    ref.write_text("a.bin\n")
+    refuse(ws, "a.bin", str(ref))
+    ref.unlink()
+    (ws.artifacts / "images").mkdir()
+    (ws.artifacts / "images" / "x-manifest.json").write_text("a.bin\n")
+    refuse(ws, "a.bin", "x-manifest.json")
+
+
+def test_nothing_to_search_is_a_refusal_not_a_clear_result(ws, monkeypatch):
+    ws.add("a.bin")
+    monkeypatch.setenv("GLASSINE_ART_PLACES", "")
+    assert "no places to search" in ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    assert "no places to search" in ws.art("rm", "a.bin", "--why", "x", "--retention-said", "a.bin", "yes", code=1).stderr
+    monkeypatch.delenv("GLASSINE_ART_PLACES")
+    config = ws.home / "workspace.toml"
+    config.write_text("[art]\nsearch = []\n")
+    assert "no places to search" in ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    for text in ('[art]\nsearch = "/tmp"\n', "[art]\nsearch = [1, 2]\n", "art = 3\n"):
+        config.write_text(text)
+        err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+        assert "has to be a list" in err and str(config) in err
+    assert ws.art("path", "a.bin").stdout
+
+
+@pytest.mark.parametrize("change, words", [
+    (lambda e: e.update(keep="soon"), "keep"),
+    (lambda e: e.pop("sha256"), "sha256"),
+    (lambda e: e.update(size="big"), "size"),
+    (lambda e: e.update(tombstone="gone"), "tombstone"),
+])
+def test_a_hand_edited_entry_stops_every_command_in_words_naming_file_and_line(ws, change, words):
+    ws.add("a.bin")
+    ws.add("b.bin")
+    path = Path(ws.art("path", "b.bin").stdout.strip())
+    rows = entries(ws)
+    change(rows[1])
+    write_entries(ws, "bases", rows)
+    manifest = ws.artifacts / "bases" / "manifest.jsonl"
+    before = manifest.read_text()
+    for args in (("find",), ("path", "a.bin"), ("verify",), ("rm", "b.bin", "--why", "x"),
+                 ("add", ws.file("c.bin"), "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user")):
+        err = ws.art(*args, code=1).stderr
+        assert f"{manifest} line 2" in err and words in err and "Traceback" not in err, err
+    assert manifest.read_text() == before and path.exists()
+
+
+@pytest.mark.parametrize("line", ["[1, 2]", "3", '"text"', "null"])
+def test_a_manifest_line_that_isnt_an_object_stops_in_words(ws, line):
+    ws.add("a.bin")
+    manifest = ws.artifacts / "bases" / "manifest.jsonl"
+    manifest.write_text(manifest.read_text() + line + "\n")
+    err = ws.art("find", code=1).stderr
+    assert f"{manifest} line 2 isn't an entry" in err and "Traceback" not in err
+
+
+def test_a_manifest_that_isnt_utf8_or_a_broken_workspace_toml_stops_in_words(ws, monkeypatch):
+    ws.add("a.bin")
+    manifest = ws.artifacts / "bases" / "manifest.jsonl"
+    manifest.write_bytes(manifest.read_bytes() + b'{"x": "caf\xe9"}\n')
+    err = ws.art("find", code=1).stderr
+    assert f"{manifest} isn't UTF-8" in err and "Traceback" not in err
+    manifest.write_bytes(manifest.read_bytes().split(b"\n")[0] + b"\n")
+    monkeypatch.delenv("GLASSINE_ART_PLACES")
+    config = ws.home / "workspace.toml"
+    config.write_text("[art\nsearch = 1\n")
+    err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    assert str(config) in err and "line 1" in err and "Traceback" not in err
+
+
+@needs_permissions
+def test_verify_reports_a_file_it_cant_read_and_carries_on(ws):
+    for name in ("one.bin", "two.bin", "three.bin"):
+        (ws.old_tree / name).write_text(name)
+        ws.art("add", ws.old_tree / name, "--in-place", "--to", "vendor", "--class", "vendor", "--what", "x", "--keep", "user")
+    (ws.old_tree / "one.bin").chmod(0o000)
+    (ws.old_tree / "three.bin").write_text("changed")
+    try:
+        done = ws.art("verify", code=1)
+    finally:
+        (ws.old_tree / "one.bin").chmod(0o600)
+    assert "unreadable  one.bin" in done.stdout and "changed  three.bin" in done.stdout and "Traceback" not in done.stderr
+    assert "two.bin" not in done.stdout
+
+
+def test_the_files_skipped_as_binary_are_named_in_the_output_and_the_tombstone(ws):
+    ws.add("a.bin")
+    utf16 = ws.old_tree / "notes16.txt"
+    utf16.write_bytes("see a.bin\n".encode("utf-16"))  # text, but with NULs
+    logged = ws.old_tree / "run.log"
+    logged.write_bytes(b"a.bin\0\n")
+    out = ws.art("rm", "a.bin", "--why", "x", "--dry-run").stdout
+    assert "2 of them binary" in out
+    assert f"skipped as binary: {utf16}" in out and f"skipped as binary: {logged}" in out
+    ws.art("rm", "a.bin", "--why", "x")
+    assert sorted(entries(ws)[0]["tombstone"]["search"]["binary_paths"]) == sorted([str(utf16), str(logged)])
+
+
+def test_mountinfo_is_unescaped_so_a_mount_point_with_a_space_is_known(tmp_path):
+    table = tmp_path / "mountinfo"
+    table.write_bytes(b"36 35 98:0 / /mnt/my\\040disk rw - ext4 /dev/x rw\n"
+                      b"37 35 98:1 / /mnt/tab\\011and\\134slash rw,noatime shared:1 - ext4 /dev/y rw\n"
+                      b"38 35 98:2 / /mnt/\xc3\xa4 rw - ext4 /dev/z rw\n"
+                      b"39 35 98:3 / /plain rw - tmpfs t rw\n"
+                      b"short\n\n")
+    assert artstore._mounts(str(table)) == {"/mnt/my disk", "/mnt/tab\tand\\slash", "/mnt/ä", "/plain"}
+    assert artstore._mounts(str(tmp_path / "missing")) == set()
+
+
+def test_a_mounted_folder_inside_a_place_is_skipped_and_counted(ws, monkeypatch):
+    """The skipping is run against a made-up mount list: mounting needs root, so no real mount is covered here."""
+    ws.add("a.bin")
+    mounted = ws.old_tree / "my disk"
+    mounted.mkdir()
+    (mounted / "ref.txt").write_text("a.bin\n")
+    (ws.old_tree / "plain.txt").write_text("nothing\n")
+    monkeypatch.setattr(artstore, "_mounts", lambda: {str(mounted.resolve())})
+    folder, entry = artstore.resolve("a.bin")
+    hits, stats = artstore.search(entry, folder)
+    assert hits == [] and stats["mounts"] == [str(mounted.resolve())]
+    assert "1 other file systems" in artstore.coverage(stats)
+    monkeypatch.setenv("GLASSINE_ART_PLACES", str(mounted))  # a mount that is a place itself is read
+    assert artstore.search(entry, folder)[0] == [str(mounted.resolve() / "ref.txt")]

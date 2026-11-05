@@ -4,7 +4,8 @@
 Everything on the device goes through Device.run, a shell script on the stdin of a configurable ssh
 command, so each step can also be done by hand and tests can run it against a local folder. The
 scripts use plain POSIX sh and the device's own clock. They never read the daemon's /run files: the
-control FIFO blocks whoever reads it. A setting or probe that points there is refused on loading.
+control FIFO blocks whoever reads it. A setting or probe that points there is refused on loading, but
+that is a tripwire for a slip, not a guarantee: see touches_run.
 """
 from __future__ import annotations
 
@@ -63,6 +64,10 @@ _RUN = re.compile(r"(?<![\w.$}-])(?:/var)?/run(?![\w.-])")
 
 
 def touches_run(text: str) -> bool:
+    """Whether a setting or probe names /run in one of its plain spellings. It is a text match: a tripwire for a slip, not
+    a guarantee. It misses /usr/../run, /./run, /proc/1/root/run, /ru''n, /r*n, and `cd / && cat run/x`, so whoever writes
+    dev.toml has to mean it. It looks for /run only: other reads that crash a SoC, which the device pages list, are not
+    checked for, and the scripts dev writes itself avoid them by what they read, not by this test."""
     return bool(_RUN.search(text))
 
 

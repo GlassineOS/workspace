@@ -141,20 +141,24 @@ def _live(name: str) -> dict | None:
 
 
 def add_gpu(a) -> int:
-    if not a.file.is_file():
-        raise ToolError(f"not a file: {a.file}")
+    # All of it before the log is stored: a log with no dump would stay, kept as long as the dump would have been.
+    artstore.check_keep(a.keep)
+    artstore.check_source(a.file, a.in_place)
+    if a.log:
+        artstore.check_source(a.log)
+    own_id = artstore.digest(a.file)[:artstore.ID_LENGTH]
+    if stored := _live(f"gpu-{own_id}"):
+        print(f"{stored['id']}: already stored, {a.file} stays where it is. Its record stands: --log and the flags weren't applied")
+        return 0
     found, said = parse_dump(a.file)
     logged = None
     if a.log:
-        if not a.log.is_file():
-            raise ToolError(f"not a file: {a.log}")
         with open(a.log, errors="replace") as f:
             for line in f:
                 _kernel_says(line, said)
         logged = f"log-{artstore.digest(a.log)[:artstore.ID_LENGTH]}"
     # Nothing ties a log line to this dump: a log can hold two faults. One value can be believed, two can't.
     found.update({field: next(iter(values)) for field, values in said.items() if len(values) == 1})
-    own_id = artstore.digest(a.file)[:artstore.ID_LENGTH]
     record = {"kind": "gpu", **found, "ran": a.ran, "mesa": a.mesa, "profile": a.profile}
     for key, value in (("app", a.app), ("kernel", a.kernel), ("ring", a.ring), ("preempt_state", a.preempt_state),
                        ("shader_hash_candidate", a.shader_hash)):
@@ -164,18 +168,22 @@ def add_gpu(a) -> int:
     record["time_from"] = "flag" if given is not None else "dump" if "time" in record else "file date"
     record["time"] = given if given is not None else record.get("time", a.file.stat().st_mtime)
     record["event"] = _event_for(a, record, own_id)
+    made = wslib.utc(record["time"])
+    log_is_new = False
     if logged:
         record["log"] = logged
-        artstore.add(a.log, "dumps", name=logged, cls="user-data", what=f"kernel log around GPU fault {own_id}",
-                     keep=a.keep, by=a.by, copy=True, extra={"dump": {"kind": "gpu-log"}})
+        _, log_is_new = artstore.add(a.log, "dumps", name=logged, cls="user-data", what=f"kernel log around GPU fault {own_id}",
+                                     keep=a.keep, by=a.by, copy=True, extra={"dump": {"kind": "gpu-log"}})
     missing = [k for k in ("rbbm_status", "ib1_rem", "ring", "preempt_state") if k not in record and k not in said]
     what = f"GPU fault: {record.get('app', 'unknown app')} on {record.get('kernel', 'unknown kernel')}"
-    entry, new = artstore.add(a.file, "dumps", name=f"gpu-{own_id}", cls="user-data", what=what, keep=a.keep, by=a.by,
-                              sources=[logged] if logged else [], made=wslib.utc(record["time"]), in_place=a.in_place,
-                              copy=a.copy, extra={"dump": record})
-    if not new:
-        print(f"{entry['id']}: already stored, {a.file} stays where it is")
-        return 0
+    try:
+        entry, _ = artstore.add(a.file, "dumps", name=f"gpu-{own_id}", cls="user-data", what=what, keep=a.keep, by=a.by,
+                                sources=[logged] if logged else [], made=made, in_place=a.in_place, copy=a.copy,
+                                extra={"dump": record})
+    except (ToolError, OSError):
+        if log_is_new:
+            print(f"the log was stored as {logged}, but the dump wasn't: nothing refers to that log", file=sys.stderr)
+        raise
     print(entry["id"])
     if record["event"] != own_id:
         print(f"linked as one event with {record['event']}")

@@ -129,6 +129,50 @@ def test_a_flag_settles_what_a_log_disagrees_on(ws):
     assert record(ws, done.stdout.strip())["dump"]["ring"] == 2 and "more than one ring" not in done.stderr
 
 
+def log_entries(ws):
+    path = ws.artifacts / "dumps" / "manifest.jsonl"
+    entries = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return [e for e in entries if e["dump"]["kind"] == "gpu-log"]
+
+
+def test_a_symlinked_dump_is_refused_and_stores_no_log(ws):
+    link = ws.tmp / "link"
+    link.symlink_to(write_dump(ws))
+    ws.tool("dumps", "add", link, "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), code=1)
+    assert log_entries(ws) == [] and link.is_symlink()
+
+
+def test_a_dump_in_the_build_cache_in_place_is_refused_and_stores_no_log(ws):
+    cache = ws.user_home / ".cache" / "glassine"
+    cache.mkdir(parents=True)
+    dump = cache / "devcd"
+    dump.write_text(dump_text())
+    ws.tool("dumps", "add", dump, "--in-place", "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), code=1)
+    assert log_entries(ws) == [] and dump.exists()
+
+
+@pytest.mark.parametrize("bad", [["--keep", "soon"], ["--time", "whenever"], ["--event-with", "nope"]])
+def test_a_bad_flag_stores_neither_the_log_nor_the_dump(ws, bad):
+    dump = write_dump(ws)
+    ws.tool("dumps", "add", dump, "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), *bad, code=1)
+    assert log_entries(ws) == [] and dump.exists()
+
+
+def test_adding_a_dump_again_stores_no_log_applies_no_flag_and_says_so(ws):
+    first = add(ws, "--ring", "1")
+    before = manifest(ws)
+    done = ws.tool("dumps", "add", write_dump(ws), "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), "--ring", "9")
+    assert done.stdout.startswith(f"{first}: already stored") and "--log and the flags weren't applied" in done.stdout
+    assert manifest(ws) == before and (ws.tmp / "devcd").exists()
+
+
+def test_two_dumps_can_share_a_log(ws):
+    log = ws.file("dmesg", FAULT_LINE.format(ring=2))
+    a = add(ws, "--log", log)
+    b = add(ws, "--log", log, rbbm="0x1", time=TIME + 1000)
+    assert record(ws, a)["dump"]["log"] == record(ws, b)["dump"]["log"] and len(log_entries(ws)) == 1
+
+
 def test_mesa_profile_and_what_ran_are_required(ws):
     path = write_dump(ws)
     for missing in (["--profile", "p", "--ran", "r"], ["--mesa", "m", "--ran", "r"], ["--mesa", "m", "--profile", "p"]):

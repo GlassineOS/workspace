@@ -616,14 +616,21 @@ def test_does_alone_is_refused_up_or_down(rig, hub, up):
 
 
 def test_a_go_the_hub_says_yes_to_runs_and_is_asked_with_the_token(rig, hub):
-    h = hub(decision_check=HUB_YES)
+    h = hub(decision_use=HUB_YES)
     rig.take("a", "--does", "reboot", "--go", "7", cmd=["true"])
-    [ask] = [r for r in h.seen if r["op"] == "decision.check"]
+    [ask] = [r for r in h.seen if r["op"] == "decision.use"]  # a take that gets through spends a run
+    assert not [r for r in h.seen if r["op"] == "decision.check"]
     assert (ask["id"], ask["kind"], ask["actions"], ask["agent_token"]) == ("7", "go", ["reboot"], "tool-token")
 
 
+def test_a_refused_take_spends_nothing(rig, hub):
+    h = hub(decision_use=HUB_YES, decision_holding={"ok": True, "holding": True})
+    rig.take("a", "--does", "reboot", "--go", "7", code=1)
+    assert not [r for r in h.seen if r["op"] == "decision.use"] and not rig.device.lock.exists()
+
+
 def test_a_go_the_hub_says_no_to_gives_the_lock_back(rig, hub):
-    hub(decision_check=HUB_NO)
+    hub(decision_use=HUB_NO)
     assert "doesn't cover suspend" in rig.take("a", "--does", "suspend", "--go", "7", code=1).stderr
     assert not rig.device.lock.exists()
 
@@ -657,7 +664,7 @@ def test_holding_the_device_refuses_go_said(rig, hub):
 
 
 def test_holding_the_device_doesnt_refuse_an_eye_test(rig, hub):
-    hub(decision_check=HUB_YES, decision_holding={"ok": True, "holding": True})
+    hub(decision_use=HUB_YES, decision_holding={"ok": True, "holding": True})
     rig.take("a", "--does", "eye-test", "--go", "7", cmd=["true"])
     assert "has the device" in rig.take("a", "--does", "eye-test,reboot", "--go", "7", code=1).stderr
 

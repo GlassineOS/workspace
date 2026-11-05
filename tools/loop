@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Try a build on the device: bind it over the live binary, test, and restore.
+
+  loop run NAME... --as WHO [--set S] [--expect 30m] [--source NAME=DIR]... [--config NAME:KEY=VALUE]...
+           [--go ID | --go-said WORDS] [--dirty WHY] [--ahead WHY] -- CMD...
+  loop up NAME... --as WHO ...                  build, copy, bind, record, and stay bound
+  loop restore NAME... --as WHO [--set S] [--next-restart] [--go ID | --go-said WORDS]
+  loop list
+  loop check [NAME...]                          are the recipes sound? Reads no device and builds nothing
+  loop show NAME                                the shell a recipe becomes. It runs nothing
+
+The lock: loop joins a take by WHO, and never releases it. With no take it refuses, unless --expect makes one, which
+then stays until dev release --as WHO. A failed check on restore doesn't stop the restore: after a hang test is when
+it's needed. Actions (--does) come from the recipe, and restarting a compositor needs a go: close-apps.
+
+Each step: build for arm64 on this host, copy to a folder on writable storage with its own restore.sh, bind over the
+live binary, record it in overrides.d, restart or re-execute, check what's running is the copy, reapply live values.
+Reboot is the rollback. --next-restart leaves it bound and marks the record, when a restore would close your windows.
+
+loop/<name>/loop.toml, one per binary. The commands in it are shell on the device:
+
+  what = "one line"
+  binary = "NAME"                   its process name
+  role = "daemon"                   daemon (never killed by hand), compositor (closes every window) or other
+  target = "/usr/bin/NAME"          the live binary the bind goes over
+  storage = "/some/writable/folder" where the per-override folders go. Must allow running binaries
+  set = "SET"                       binaries that speak one protocol, which swap together
+  expect = "30m"
+  closes_windows = true             needs a go, and a compositor must say it
+  does = []                         any other named actions
+
+  [build]
+  repo = "REPO"                     the source: --source NAME=DIR, or the main checkout of REPO
+  command = ["make", "arm64"]       in that folder
+  output = "out/NAME"
+  timeout = "30m"
+
+  [protocol]                        a constant in the source, compared across the set before anything happens
+  file = "src/protocol.h"
+  pattern = 'VERSION\\s+(\\d+)'
+
+  [restart]
+  stop = "..."                      returns once told; loop then waits for the process to go
+  start = "..."                     run with the session's own environment
+  reexec = "..."                    if it can re-execute itself, up uses that, and no windows close
+  environment_from = "NAME"         the process whose environment start gets: the binary itself by default
+  stop_seconds = 15
+  start_seconds = 15
+
+  [live]
+  reapply = '...'                   sets one value, given as $name and $value, after each restart
+
+  [config]
+  path = "/etc/NAME.conf"           KEY=VALUE lines. Only loop writes it: in place, so inode and mode stay
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import re
+import shlex
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import artstore  # noqa: E402
+import devlib  # noqa: E402
+import kitlib  # noqa: E402
+import looplib  # noqa: E402
+import wslib  # noqa: E402
+from wslib import ToolError  # noqa: E402
+
+CHUNK = 8 << 20  # one ssh per chunk, so a big binary doesn't ask a small shell for one enormous here-document
+
+
+class Stopped(BaseException):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def stop_on_signal(signum, _frame):
+    raise Stopped(signum)
+
+
+def signals(handler) -> None:
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, handler)
+
+
+def chosen(a) -> list[looplib.Recipe]:
+    names = list(a.names)
+    if a.set:
+        members = [n for n in kitlib.names("loop") if looplib.load(n).set == a.set]
+        if not members:
+            raise ToolError(f"no recipe is in the set {a.set}")
+        names += [n for n in members if n not in names]
+    if not names:
+        raise ToolError("name a recipe, or --set")
+    return [looplib.load(n) for n in dict.fromkeys(names)]
+
+
+def connect(recipes) -> devlib.Device:
+    """A script may wait for stops and starts, longer than dev's own quick commands."""
+    config = devlib.load_config()
+    longest = sum(r.stop_seconds + 2 * r.start_seconds + 30 for r in recipes)
+    config.values["ssh_seconds"] = max(config.ssh_seconds, longest)
+    return devlib.Device(config)
+
+
+def join(a, device, recipes, purpose: str, st=None, dirty_ok=False) -> devlib.State:
+    """dev take, whose exit status decides. Only actions the lock doesn't have yet go to it, as those need a go."""
+    st = st or device.read(devlib.CHECK_PROBES)
+    mine = st.locked and st.owner == a.name
+    held = st.lock.get("does", "").split(",") if mine else []
+    does = [x for r in recipes for x in r.does if x not in held]
+    does = list(dict.fromkeys(does))
+    if dirty_ok and mine and not a.dirty:
+        bad = [c for c in devlib.device_check(device.config, st) if c.state == "fail"]
+        if bad:
+            a.dirty = "restoring: " + "; ".join(map(str, bad))
+    argv = kitlib.take_argv(a.name, purpose, a, does, getattr(a, "expect", None))
+    done = subprocess.run(argv)
+    if done.returncode:
+        hint = "" if getattr(a, "expect", None) else ". loop joins a take: dev take first, or give --expect"
+        raise ToolError(f"no lock, so nothing was done{hint}")
+    for r in recipes:
+        if r.closes_windows:
+            print(f"loop: {r.name}: restarting {r.binary} closes every app window", file=sys.stderr)
+    return device.read(devlib.CHECK_PROBES)
+
+
+def source_dirs(a, recipes) -> dict[str, Path]:
+    given = {}
+    for item in a.source:
+        name, sep, path = item.partition("=")
+        if not sep or name not in {r.name for r in recipes}:
+            raise ToolError(f"--source {item}: NAME=DIR, for a recipe being swapped")
+        given[name] = Path(path)
+    return given
+
+
+def constant(r: looplib.Recipe, folder: Path) -> str | None:
+    try:
+        match = re.search(r.protocol["pattern"], (folder / r.protocol["file"]).read_text(), re.M)
+    except OSError:
+        return None
+    return match[1] if match else None
+
+
+def check_protocol(recipes, given) -> None:
+    """A true mismatch comes from here, as one set of pins installs both sides. Compared before anything is touched."""
+    for group in {r.set for r in recipes if r.set and r.protocol}:
+        found = {}
+        swapping = {r.name for r in recipes}
+        for name in kitlib.names("loop"):
+            other = looplib.load(name)
+            if other.set != group or not other.protocol:
+                continue
+            value = constant(other, given.get(name) or wslib.home() / other.repo)
+            if value is None and name in swapping:
+                raise ToolError(f"{name}: no protocol constant found in {other.protocol['file']}")
+            if value is None:
+                print(f"loop: warning: {name}: its protocol constant can't be read, so it isn't compared", file=sys.stderr)
+            else:
+                found[name] = value
+        if len(set(found.values())) > 1:
+            shown = ", ".join(f"{k} {v}" for k, v in sorted(found.items()))
+            raise ToolError(f"the set {group} doesn't agree on its protocol: {shown}. A protocol change swaps its set together: loop up --set {group}")
+
+
+def parse_settings(a, recipes) -> None:
+    byname = {r.name: r for r in recipes}
+    for item in a.config:
+        name, sep, rest = item.partition(":")
+        key, eq, value = rest.partition("=")
+        if not (sep and eq) or name not in byname:
+            raise ToolError(f"--config {item}: NAME:KEY=VALUE, for a recipe being swapped")
+        if not byname[name].config:
+            raise ToolError(f"--config {item}: its recipe names no [config]")
+        looplib.check_setting(key, value)
+        byname[name].settings[key] = value
+
+
+def build(r, folder: Path) -> Path:
+    if not folder.is_dir():
+        raise ToolError(f"{r.name}: no source at {folder}: --source {r.name}=DIR")
+    print(f"loop: {r.name}: building in {folder}", file=sys.stderr)
+    try:
+        done = subprocess.run(r.build, cwd=folder, timeout=r.build_seconds, stdout=sys.stderr)
+    except subprocess.TimeoutExpired:
+        raise ToolError(f"{r.name}: the build took longer than {r.build_seconds} s") from None
+    if done.returncode:
+        raise ToolError(f"{r.name}: the build failed, exit {done.returncode}. Nothing on the device changed")
+    output = folder / r.output
+    if not output.is_file():
+        raise ToolError(f"{r.name}: the build made no {r.output}")
+    return output
+
+
+def copy(device, r, binary: Path, sha: str) -> None:
+    """Text through dev's one seam. The hash on the device decides."""
+    folder = shlex.quote(r.folder)
+    device.do(f"rm -rf {folder} && mkdir -p {folder} && : > {folder}/binary")
+    with open(binary, "rb") as f:
+        while chunk := f.read(CHUNK):
+            text = base64.encodebytes(chunk).decode()
+            device.do(f"base64 -d >> {folder}/binary <<'LOOP_EOF'\n{text}LOOP_EOF")
+    got = device.do(f"sha256sum {folder}/binary | cut -d' ' -f1").strip()
+    if got != sha:
+        raise ToolError(f"{r.name}: the copy on the device has another hash: {got}. Nothing is bound")
+    device.do(f'chmod "$(stat -c %a {shlex.quote(r.target)})" {folder}/binary')
+
+
+def bring_up(a, device, recipes) -> None:
+    given = source_dirs(a, recipes)
+    parse_settings(a, recipes)
+    check_protocol(recipes, given)  # before the lock's checks and the build: nothing is touched yet
+    st = join(a, device, recipes, a.purpose or f"loop {' '.join(r.name for r in recipes)}")
+    if st.owner != a.name:
+        raise ToolError(f"the lock isn't held by {a.name}")
+    for r in recipes:
+        record = st.overrides.get(r.override)
+        if record and not st.dead_override(record):
+            raise ToolError(f"{r.name} is already up, by {record.get('owner', '?')}: loop restore first")
+        if any(k.startswith(r.override + "-config-") for k in st.overrides):
+            raise ToolError(f"{r.name}: a config change from an earlier up is still there: loop restore first, or its original is lost")
+    shas = {}
+    for r in recipes:
+        output = build(r, given.get(r.name) or wslib.home() / r.repo)
+        shas[r.name] = artstore.digest(output)
+        copy(device, r, output, shas[r.name])
+        script = looplib.restore_script(r, device.config.store, device.probe_command("boot_id"), device.probe_command("binds"))
+        device.do(f"cat > {shlex.quote(r.folder + '/restore.sh')} <<'LOOP_EOF'\n{script}LOOP_EOF\nchmod 700 {shlex.quote(r.folder + '/restore.sh')}")
+    script = looplib.up_script(recipes, device.config.store, device.probe_command("boot_id"), device.probe_command("binds"), a.name, st.boot, shas)
+    a.swapping = True  # from here anything may be bound, so loop run restores whatever happens
+    done = device.run(script)
+    sys.stderr.write(done.stderr)
+    if done.returncode:
+        raise ToolError(f"on the device: exit {done.returncode}: anything bound stays recorded: loop restore, or reboot, which is the rollback")
+    for r in recipes:
+        print(f"{r.name}: up, {r.target} is {shas[r.name][:12]}")
+
+
+def bring_down(a, device, recipes) -> int:
+    """Not through a --dirty the person has to think of: after a hang test is when this matters most."""
+    st = device.read(devlib.CHECK_PROBES)
+    if not st.locked or st.owner != a.name:
+        raise ToolError(f"restoring needs the lock: dev take --as {a.name}, with --dirty if the device's state stops it")
+    join(a, device, recipes, a.purpose or "loop restore", st=st, dirty_ok=True)
+    known = [r for r in recipes if any(k == r.override or k.startswith(r.override + "-config-") for k in st.overrides)]
+    for r in recipes:
+        if r not in known:
+            print(f"loop: {r.name}: no override recorded, nothing to restore", file=sys.stderr)
+    if not known:
+        return 0
+    # all stopped first, so a set never speaks across versions on the way back either
+    stops = "\n".join(looplib.stop_block(r) for r in known if binds_now(device, r, st))
+    steps = "\n".join(f"sh {shlex.quote(r.folder + '/restore.sh')} || loop_failed=$?" for r in known)
+    done = device.run(f"set -u\nloop_failed=0\n{stops}\n{steps}\nexit \"$loop_failed\"\n")
+    sys.stderr.write(done.stderr)
+    if done.returncode:
+        print(f"loop: restore: exit {done.returncode}, see above. Reboot is the rollback", file=sys.stderr)
+        return 1
+    for r in known:
+        print(f"{r.name}: restored")
+    return 0
+
+
+def binds_now(device, r, st) -> bool:
+    got = st.probes.get("binds")
+    return bool(got and not got[0] and r.target in devlib.mountinfo_binds(got[1], [r.target]))
+
+
+def next_restart(a, device, recipes) -> int:
+    st = device.read()
+    for r in recipes:
+        record = st.overrides.get(r.override)
+        if not record or record.get("owner") != a.name:
+            raise ToolError(f"{r.name}: no override of {a.name}'s")
+        device.do(f"sed 's/^removed: .*/removed: next agreed restart/' overrides.d/{r.override} > overrides.d/{r.override}.tmp && "
+                  f"mv overrides.d/{r.override}.tmp overrides.d/{r.override}")
+        print(f"{r.name}: stays bound until the next agreed restart. {record.get('remove', '')} takes it down, as does a reboot")
+    return 0
+
+
+def up(a) -> int:
+    recipes = chosen(a)
+    device = connect(recipes)
+    bring_up(a, device, recipes)
+    print(f"loop: {a.name} still holds the lock. loop restore, and then dev release --as {a.name} if this take was loop's", file=sys.stderr)
+    return 0
+
+
+def restore(a) -> int:
+    recipes = chosen(a)
+    device = connect(recipes)
+    return next_restart(a, device, recipes) if a.next_restart else bring_down(a, device, recipes)
+
+
+def run(a, cmd) -> int:
+    if not cmd:
+        raise ToolError("loop run needs a test: -- CMD...")
+    recipes = chosen(a)
+    device = connect(recipes)
+    code = 1
+    a.swapping = False
+    signals(stop_on_signal)
+    try:
+        bring_up(a, device, recipes)
+        code = devlib.run_cmd(cmd)
+    except Stopped as e:
+        code = 128 + e.signum
+    except ToolError as e:
+        print(f"loop: {e}", file=sys.stderr)
+    signals(signal.SIG_IGN)  # it's finishing: let it restore
+    if a.swapping:
+        try:
+            if bring_down(a, device, recipes):
+                code = code or 1
+        except ToolError as e:
+            print(f"loop: {e}\nloop: it may still be bound: loop restore, or reboot, which is the rollback", file=sys.stderr)
+            code = code or 1
+    print(f"loop: {a.name} still holds the lock", file=sys.stderr)
+    return code
+
+
+def show(a) -> int:
+    r = looplib.load(a.name)
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    boot, binds = device.probe_command("boot_id"), device.probe_command("binds")
+    print("# up\n" + looplib.up_script([r], config.store, boot, binds, "WHO", "BOOT", {r.name: "SHA256_OF_THE_BUILD"}))
+    print("# restore.sh\n" + looplib.restore_script(r, config.store, boot, binds))
+    return 0
+
+
+def check(a) -> int:
+    bad = 0
+    for name in a.names or kitlib.names("loop"):
+        try:
+            looplib.load(name)
+            print(f"{name}: sound")
+        except ToolError as e:
+            bad += 1
+            print(e, file=sys.stderr)
+    return 1 if bad else 0
+
+
+def listing(_a) -> int:
+    for name in kitlib.names("loop"):
+        r = looplib.load(name)
+        print(f"{name}  {r.role}  {r.target}  {r.what}" + (f"  (does: {', '.join(r.does)})" if r.does else ""))
+    return 0
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = []
+    if "--" in argv:
+        at = argv.index("--")
+        argv, cmd = argv[:at], argv[at + 1:]
+    p = argparse.ArgumentParser(prog="loop", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("run", "up", "restore"):
+        s = sub.add_parser(name)
+        s.add_argument("names", nargs="*")
+        s.add_argument("--set")
+        s.add_argument("--purpose")
+        kitlib.add_take_flags(s)
+        if name != "restore":
+            s.add_argument("--expect")
+            s.add_argument("--source", action="append", default=[], metavar="NAME=DIR")
+            s.add_argument("--config", action="append", default=[], metavar="NAME:KEY=VALUE")
+        else:
+            s.add_argument("--next-restart", action="store_true")
+    sub.add_parser("list")
+    sub.add_parser("check").add_argument("names", nargs="*")
+    sub.add_parser("show").add_argument("name")
+    a = p.parse_args(argv)
+    if cmd and a.command != "run":
+        raise ToolError(f"loop {a.command} takes no command")
+    if a.command in ("run", "up", "restore") and not a.name:
+        raise ToolError("--as: this needs the device, and so the lock")
+    return {"run": lambda x: run(x, cmd), "up": up, "restore": restore, "list": listing, "check": check, "show": show}[a.command](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(wslib.run("loop", main))

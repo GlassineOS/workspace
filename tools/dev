@@ -45,7 +45,6 @@ import re
 import secrets
 import shlex
 import signal
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -170,26 +169,6 @@ def go_record(a, actions) -> str:
     return f"said: {word(a.go_said)} (for: {','.join(actions) or 'nothing named'})" if a.go_said else ""
 
 
-def run_cmd(cmd: list[str]) -> int:
-    """CMD on this host. A signal to dev goes on to it, and dev carries on to the release."""
-    try:
-        child = subprocess.Popen(cmd)
-    except OSError as e:
-        print(f"dev: can't run {cmd[0]}: {e}", file=sys.stderr)
-        return 127
-
-    def forward(signum, _frame):
-        child.send_signal(signum)
-
-    old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-    try:
-        code = child.wait()
-    finally:
-        for s, handler in old.items():
-            signal.signal(s, handler)
-    return 128 - code if code < 0 else code
-
-
 def give_back(device, token: str) -> None:
     device.do(f'[ "$(cat lock.d/made 2>/dev/null)" = {shlex.quote(token)} ] && rm -rf lock.d; :')
 
@@ -274,7 +253,7 @@ def join(a, cmd, config, device, st) -> int:
     report(config, device)
     if not cmd:
         return 0
-    code = run_cmd(cmd)
+    code = devlib.run_cmd(cmd)
     report(config, device)
     return code
 
@@ -319,7 +298,7 @@ def take(a, cmd) -> int:
     if not cmd:
         return 0
 
-    code = run_cmd(cmd)
+    code = devlib.run_cmd(cmd)
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):  # it's finishing: let it record and release
         signal.signal(s, signal.SIG_IGN)
     released = True

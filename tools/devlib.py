@@ -12,8 +12,10 @@ import json
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -387,6 +389,26 @@ def move_hangcheck_base(st: State) -> str:
     if got is None or got[0] or not got[1].isdigit():
         return ":"
     return put("hangcheck-base", f"{st.boot} {got[1]}")
+
+
+def run_cmd(cmd: list[str]) -> int:
+    """CMD on this host. A signal to dev goes on to it, and dev carries on to the release."""
+    try:
+        child = subprocess.Popen(cmd)
+    except OSError as e:
+        print(f"dev: can't run {cmd[0]}: {e}", file=sys.stderr)
+        return 127
+
+    def forward(signum, _frame):
+        child.send_signal(signum)
+
+    old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        code = child.wait()
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler)
+    return 128 - code if code < 0 else code
 
 
 # --- the hub: one JSON line in, one out, hubd's socket on this host. Never needed for the device.

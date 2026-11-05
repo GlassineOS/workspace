@@ -218,7 +218,8 @@ def add_ram(a) -> int:
     for path in (*a.images, a.kernel_log):
         if path.is_symlink() or not path.is_file():
             raise ToolError(f"not a regular file: {path}")
-        artstore.check_name(path.name)
+    for image in a.images:  # the log's own name is never used: it's stored as ram-ID-kernel.log
+        artstore.check_name(image.name)
     named = [path.resolve() for path in (*a.images, a.kernel_log)]
     if len(set(named)) != len(named):
         raise ToolError("a file is named twice: each image and the kernel log are stored once, and moved")

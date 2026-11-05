@@ -489,6 +489,13 @@ def test_a_second_image_can_join_a_stored_ram_log(ws):
     assert sorted(e["dump"]["kind"] for e in manifest(ws)) == ["ram", "ram", "ram-log"]
 
 
+def test_a_kernel_log_can_have_any_name(ws):
+    ws.add("kernel-build")
+    ws.tool("dumps", "add-ram", ws.file("J.BIN"), "--build", "kernel-build", "--kernel-log", ws.file("dmesg (1).txt", "x"),
+            "--until", "2999-01-01", "--ran", "x")
+    assert not (ws.tmp / "dmesg (1).txt").exists()
+
+
 def test_a_file_named_twice_moves_nothing(ws):
     ws.add("kernel-build")
     image, klog = ws.file("J.BIN"), ws.file("klog", "x")

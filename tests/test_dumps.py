@@ -283,7 +283,7 @@ def test_an_image_decoder_runs_in_a_container_with_no_network_and_read_only_moun
     id_ = add(ws)
     fake_decoder(ws, "26.0", "--image", "alpine:test")
     out = ws.tool("dumps", "show", id_).stdout
-    assert "--network none" in out and "--log-driver none" in out
+    assert "--network none" in out and "--log-driver none" in out and f"--user {os.getuid()}:{os.getgid()}" in out
     assert "target=/dump,readonly" in out and "target=/usr/local/bin/crashdec,readonly" in out
     assert "alpine:test crashdec -f /dump" in out
 

@@ -151,16 +151,17 @@ def note(checks) -> None:
             print(f"dev: {c}", file=sys.stderr)
 
 
-def go_table(actions: list[str], a, config) -> None:
-    """The take table, once the action list is known. It raises on a refusal."""
+def go_table(actions: list[str], a, config, spend: bool = False) -> None:
+    """The take table, once the action list is known. It raises on a refusal. A take that gets through spends a run of its
+    go, so that's asked last; a join only checks."""
     if not actions:
         return
-    if a.go:
-        answer, words = devlib.hub_says(actions, a.go, config.name)
-        if answer != "yes":
-            raise ToolError(f"go {a.go}: {answer}: {words}")
     if devlib.hub_holding() is True and set(actions) - WHILE_YOU_HOLD:
         raise ToolError("the person has the device (\"I've got the device\"): no --does until they press Done")
+    if a.go:
+        answer, words = devlib.hub_says(actions, a.go, config.name, spend)
+        if answer != "yes":
+            raise ToolError(f"go {a.go}: {answer}: {words}")
 
 
 def go_record(a, actions) -> str:
@@ -355,7 +356,7 @@ def passed(a, config, device, st, name) -> None:
     if bad and not a.dirty:
         raise ToolError("the device isn't clean, the lock is given back: " + "; ".join(map(str, bad)) + ". --dirty WHY to run anyway")
     note(checks)
-    go_table(a.actions, a, config)
+    go_table(a.actions, a, config, spend=True)
 
     steps = [devlib.move_hangcheck_base(st)]
     for key, value in (("go", go_record(a, a.actions)), ("dirty", word(a.dirty)), ("ahead", word(a.ahead))):

@@ -358,7 +358,7 @@ def test_a_signal_during_the_test_still_restores(lp):
     lp.recipe()
     lp.take("a")
     started = lp.tmp / "started"
-    child = subprocess.Popen([sys.executable, str(TOOLS / "loop"), "run", "widgetd", "--as", "a", "--", "sh", "-c", f'touch "{started}"; sleep 60'],
+    child = subprocess.Popen([sys.executable, str(TOOLS / "loop"), "run", "widgetd", "--as", "a", "--", "sh", "-c", f'touch "{started}"; exec sleep 60'],  # exec: a signal goes to the command, not its children, and a shell like dash would leave sleep holding the pipes
                              env=lp.env, cwd=lp.tmp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 30
     while not started.exists() and time.monotonic() < deadline:

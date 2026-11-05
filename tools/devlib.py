@@ -27,8 +27,8 @@ TEXT_CAP = 200  # purpose, notice and other free text: data for agents, so cappe
 HUB_SECONDS = 3.0  # past this the hub counts as down
 
 DEFAULTS = {
-    "name": "note-air-1",
-    "ssh": "ssh -o BatchMode=yes -o ConnectTimeout=5 root@172.16.42.1",
+    "name": "device",  # what reports and the hub call it; dev.toml names it
+    "ssh": "",  # the whole ssh command to the device, with its user and address: dev.toml or GLASSINE_DEV_SSH
     "store": "/root/glassine-dev",  # unverified: must survive a reboot, a deployment switch and a rollback
     "ssh_seconds": 30,
     "settings": "",  # the settings file the seed is compared with: particular to a device
@@ -185,6 +185,9 @@ class State:
 class Device:
     def __init__(self, config: Config):
         self.config = config
+        if not config.ssh.strip():
+            raise wslib.ToolError("no way to reach the device: set GLASSINE_DEV_SSH, or ssh in dev.toml, "
+                                  "to the ssh command, e.g. ssh -o BatchMode=yes root@HOST")
         self.argv = shlex.split(config.ssh)
         self.quoted = shlex.quote(config.store)
 

@@ -35,7 +35,7 @@ On the device, in the store folder, by hand over ssh too:
   history.d/            old lock records: released and broken
 
 Settings: dev.toml in the workspace, ignored by git (see DEFAULTS in devlib.py, [probes] for commands).
-GLASSINE_DEV_SSH and GLASSINE_DEV_STORE override it. Never give it anything under /run.
+GLASSINE_DEV_SSH and GLASSINE_DEV_STORE override it. ssh has no default: give it here or there. Never give it anything under /run.
 """
 from __future__ import annotations
 

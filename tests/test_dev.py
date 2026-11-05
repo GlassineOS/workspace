@@ -706,7 +706,7 @@ def test_a_report_goes_before_and_after_the_command_and_is_the_whole_state(rig, 
     rig.take("a", cmd=["true"])
     held, free = h.reports()
     assert held["lock"]["owner"] == "a" and free["lock"] is None
-    assert (held["device"], held["base"], held["deployment"], held["boot_image"], held["renderer"]) == ("note-air-1", "base-7", "dep-7", "boot-img", "gles2")
+    assert (held["device"], held["base"], held["deployment"], held["boot_image"], held["renderer"]) == ("device", "base-7", "dep-7", "boot-img", "gles2")
     assert held["bases"] == ["base-6", "base-7"] and held["free_kb"] > 0 and held["overrides"] == {} and held["queue"] == []
     assert held["device_time"] == DAY_ON_THE_DEVICE
     assert "made" not in held["lock"]
@@ -853,3 +853,15 @@ def test_history_is_kept_short(rig):
     rig.take("a", cmd=["true"])
     names = sorted(p.name for p in h.iterdir())
     assert len(names) == devlib.HISTORY_KEPT and "released" in names[-1] and names[0].startswith("0000000006")
+
+
+def test_without_an_ssh_command_nothing_runs_and_it_says_where_to_set_one(rig):
+    rig.env.pop("GLASSINE_DEV_SSH")
+    err = rig.dev("status", code=1).stderr
+    assert "GLASSINE_DEV_SSH" in err and "dev.toml" in err
+    assert not rig.device.log.exists()
+
+
+def test_the_device_name_comes_from_the_config(rig):
+    rig.device.config(name="bench-1")
+    assert json.loads(rig.dev("status", "--json").stdout)["device"] == "bench-1"

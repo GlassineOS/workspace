@@ -225,8 +225,8 @@ def test_a_delta_needs_a_known_parent(ws):
     assert path.exists()
 
 
-def test_parent_base_holds_even_with_no_places_to_search(ws, monkeypatch):
-    monkeypatch.setenv("GLASSINE_ART_PLACES", "")
+def test_parent_base_holds_even_when_no_file_in_the_places_names_it(ws, monkeypatch):
+    monkeypatch.setenv("GLASSINE_ART_PLACES", str(ws.old_tree))
     ws.add("base.img")
     ws.add("delta.img", "--parent-base", "base.img")
     refuse(ws, "base.img", "parent_base")
@@ -623,3 +623,31 @@ def test_a_why_that_isnt_utf8_deletes_nothing(ws):
                           capture_output=True)
     assert done.returncode == 1 and b"UTF-8" in done.stderr
     assert path.exists() and entries(ws)[0]["tombstone"] is None and leftovers(ws) == []
+
+
+def test_a_root_doesnt_hide_the_work_folders_and_artifacts_below_it(ws, monkeypatch):
+    ws.add("a.bin")
+    monkeypatch.setenv("GLASSINE_ART_PLACES", str(ws.home))  # only the workspace itself, as the reviewer ran it
+    ref = ws.checkout / "ref.txt"
+    ref.write_text("a.bin\n")
+    refuse(ws, "a.bin", str(ref))
+    ref.unlink()
+    (ws.artifacts / "images").mkdir()
+    (ws.artifacts / "images" / "x-manifest.json").write_text("a.bin\n")
+    refuse(ws, "a.bin", "x-manifest.json")
+
+
+def test_nothing_to_search_is_a_refusal_not_a_clear_result(ws, monkeypatch):
+    ws.add("a.bin")
+    monkeypatch.setenv("GLASSINE_ART_PLACES", "")
+    assert "no places to search" in ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    assert "no places to search" in ws.art("rm", "a.bin", "--why", "x", "--retention-said", "a.bin", "yes", code=1).stderr
+    monkeypatch.delenv("GLASSINE_ART_PLACES")
+    config = ws.home / "workspace.toml"
+    config.write_text("[art]\nsearch = []\n")
+    assert "no places to search" in ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    for text in ('[art]\nsearch = "/tmp"\n', "[art]\nsearch = [1, 2]\n", "art = 3\n"):
+        config.write_text(text)
+        err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+        assert "has to be a list" in err and str(config) in err
+    assert ws.art("path", "a.bin").stdout

@@ -234,11 +234,17 @@ def places() -> list[Path]:
     else:
         config = base / "workspace.toml"
         settings = tomllib.loads(config.read_text()) if config.exists() else {}
-        patterns = settings.get("art", {}).get("search", DEFAULT_PLACES)
+        art = settings.get("art", {})
+        patterns = art.get("search", DEFAULT_PLACES) if isinstance(art, dict) else None
+        if not isinstance(patterns, (list, tuple)) or not all(isinstance(p, str) for p in patterns):
+            raise ToolError(f"{config}: [art] search has to be a list of folders or patterns, like [\"~/old\", \"work/*/*\"]")
     found: dict[Path, None] = {}
     for pattern in patterns:
         for path in _expand(pattern, base):
             found[path.resolve()] = None
+    if not found:
+        raise ToolError("no places to search for references, so no search can be trusted: GLASSINE_ART_PLACES or "
+                        "[art] search in workspace.toml leaves nothing that exists")
     return list(found)
 
 
@@ -301,8 +307,7 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
     hits = _artifact_hits(entry, folder, needles)
     target = location(entry).resolve()
     roots = places()
-    pruned = set(roots) | {home().resolve() / "work", home().resolve() / "artifacts", home().resolve() / "notes"}
-    pruned |= {Path(m) for m in _mounts()}
+    pruned = set(roots) | {Path(m) for m in _mounts()}  # a root is walked as its own; nothing else is left out
     overlap = len(needles.pattern)
     store = artifacts().resolve()
     stats = {"places": [str(r) for r in roots], "files": 0, "binary": 0, "unreadable": 0, "unreadable_paths": [],

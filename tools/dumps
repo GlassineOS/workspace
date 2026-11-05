@@ -273,8 +273,9 @@ def decode_command(dump: Path, decoder: Path, image: str | None, verbose: bool) 
     flags = ["-v"] if verbose else []
     if not image:
         return [str(decoder), *flags, "-f", str(dump)]
-    # No network: a dump holds GPU memory from your apps. Mounted read-only, run as the files' owner.
-    return ["docker", "run", "--rm", "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}",
+    # No network: a dump holds GPU memory from your apps. Mounted read-only, run as the files' owner. No log driver:
+    # a daemon set to journald or syslog would otherwise keep the decoded output. Attached stdout still comes through.
+    return ["docker", "run", "--rm", "--network", "none", "--log-driver", "none", "--user", f"{os.getuid()}:{os.getgid()}",
             "-v", f"{dump}:/dump:ro", "-v", f"{decoder}:/usr/local/bin/crashdec:ro", image,
             "crashdec", *flags, "-f", "/dump"]
 

@@ -11,7 +11,7 @@ repository's own `CLAUDE.md` loads when you read its files, and applies inside i
 | `work/<task>/<repo>/` | your worktrees | All edits, builds and commits happen here. |
 | `~/.cache/glassine/` | build output, kernel objects, downloads | Not in a repository. |
 
-Lab notes, firmware and dumps live outside this tree, in the lab directory. Use `--add-dir`
+Lab notes, firmware and dumps live outside this tree. Use `--add-dir`
 when a task needs them, and never copy any of it into a repository here.
 
 ## Working

@@ -29,8 +29,9 @@ _LISTED = 100  # unreadable paths kept by name in a search's stats; the count is
 # Where `art rm` looks for references, in the order they're read. Paths starting with / or ~ have
 # to exist, or the search can't be trusted and rm refuses. Paths relative to the workspace may not
 # exist yet (notes/). A pattern only matches checkouts. Replaced by [art] search in workspace.toml,
-# or by GLASSINE_ART_PLACES (separated by colons), which is how tests inject it.
-DEFAULT_PLACES = (".", "*", "work/*/*", "artifacts", "notes", "~/BooxNoteAirHacking")
+# or by GLASSINE_ART_PLACES (separated by colons), which is how tests inject it. Folders outside the
+# workspace, such as an old tree, are named there, locally: nothing about one belongs in this file.
+DEFAULT_PLACES = (".", "*", "work/*/*", "artifacts", "notes")
 _NEVER_READ = {".git", "__pycache__", ".pytest_cache", ".venv", "node_modules"}
 
 

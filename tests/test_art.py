@@ -292,20 +292,23 @@ def test_search_sees_a_reference_past_the_first_chunk_and_across_a_chunk_edge(ws
     refuse(ws, "a.bin", str(big))
 
 
-def test_places_come_from_the_config_and_default_to_the_old_tree(ws, monkeypatch):
+def test_places_come_from_the_config_and_default_to_the_workspace_alone(ws, monkeypatch):
     monkeypatch.delenv("GLASSINE_ART_PLACES")
     monkeypatch.setenv("GLASSINE_WORKSPACE", str(ws.home))
     monkeypatch.setattr(Path, "home", classmethod(lambda _: ws.user_home))
-    assert "~/BooxNoteAirHacking" in artstore.DEFAULT_PLACES
-    (ws.user_home / "BooxNoteAirHacking").mkdir()
+    assert not [place for place in artstore.DEFAULT_PLACES if place.startswith(("~", "/"))]  # no folder of anyone's own
+    (ws.user_home / "old").mkdir()
     (ws.home / "repo").mkdir()
     (ws.home / "repo" / ".git").mkdir()
     (ws.home / "not-a-checkout").mkdir()
     found = artstore.places()
     assert ws.home in found and ws.home / "repo" in found and ws.checkout in found
-    assert ws.user_home / "BooxNoteAirHacking" in found and ws.home / "not-a-checkout" not in found
-    (ws.home / "workspace.toml").write_text(f'[art]\nsearch = ["{ws.old_tree}"]\n')
-    assert artstore.places() == [ws.old_tree]
+    assert ws.user_home / "old" not in found and ws.home / "not-a-checkout" not in found
+    (ws.home / "workspace.toml").write_text(f'[art]\nsearch = ["{ws.old_tree}", "~/old"]\n')
+    assert artstore.places() == [ws.old_tree, ws.user_home / "old"]
+    (ws.home / "workspace.toml").write_text('[art]\nsearch = ["~/not-there"]\n')
+    with pytest.raises(wslib.ToolError):  # a named place that doesn't exist means the search can't be trusted
+        artstore.places()
 
 
 def test_a_corrupt_manifest_stops_everything_rather_than_dropping_entries(ws):

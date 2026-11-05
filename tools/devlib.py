@@ -196,8 +196,8 @@ class Device:
         try:
             done = subprocess.run([*self.argv, "sh -s"], input=script, capture_output=True, text=True,
                                   timeout=self.config.ssh_seconds)
-        except subprocess.TimeoutExpired:
-            raise wslib.ToolError(f"the device didn't answer in {self.config.ssh_seconds} s; nothing is known") from None
+        except subprocess.TimeoutExpired:  # a device that is rebooting can hang rather than refuse: the same as unreachable
+            raise Unreachable(f"the device didn't answer in {self.config.ssh_seconds} s; nothing is known") from None
         except OSError as e:
             raise wslib.ToolError(f"can't run {self.argv[0]}: {e}") from e
         if done.returncode == 255:
@@ -253,7 +253,50 @@ class Device:
 
 
 class Unreachable(wslib.ToolError):
-    """ssh itself failed: the device is off, rebooting or not plugged in."""
+    """ssh itself failed or didn't answer in time: the device is off, rebooting or not plugged in."""
+
+
+# --- the take behind a lock: lock.d/running names the process on this host whose CMD the lock is held for
+
+def proc_stat(pid: int) -> tuple[str, str] | None:
+    """(state, start time) of a process on this host, or None if there's none. Only /proc/PID/stat is read."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    rest = text.rpartition(")")[2].split()  # the name in front may hold spaces and brackets
+    return (rest[0], rest[19]) if len(rest) > 19 else None
+
+
+def pid_namespace() -> str:
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
+def take_record(pid: int) -> str:
+    """What a take writes to lock.d/running, so a later release can tell whether that take is still there."""
+    found = proc_stat(pid)
+    return fields_text([("host", socket.gethostname()), ("pid", pid), ("start", found[1] if found else ""), ("ns", pid_namespace())])
+
+
+def take_has_ended(record: str) -> bool | None:
+    """Whether the take that wrote this record is gone: True or False, or None when this host can't tell. That's another
+    host or pid namespace, a record it can't read (an empty one from an older dev), or no /proc."""
+    fields = parse_fields(record)
+    pid = fields.get("pid", "")
+    if not pid.isdigit() or fields.get("host") != socket.gethostname() or not Path("/proc/self/stat").exists():
+        return None
+    if fields.get("ns") and fields["ns"] != pid_namespace():
+        return None
+    try:
+        found = proc_stat(int(pid))
+    except OSError:
+        return None
+    if found is None or found[0] in ("Z", "X"):
+        return True
+    return bool(fields.get("start")) and fields["start"] != found[1]  # a different start time: the pid is someone else's now
 
 
 def parse_read(text: str) -> State:

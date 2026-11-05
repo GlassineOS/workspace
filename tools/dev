@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import secrets
 import shlex
@@ -209,11 +210,17 @@ def do_release(config, device, name: str, token: str | None, left=None) -> None:
     A left state's hang run is what that state is after, so it takes its own hangchecks with it."""
     st = device.read(devlib.CHECK_PROBES)
     if not st.locked:
+        if token is not None:  # an earlier try of this release may have landed with its answer lost, or the lock was broken
+            print("dev: the lock this take made is already gone", file=sys.stderr)
+            return
         raise ToolError("nobody holds the lock")
     if st.owner != name:
         raise ToolError(f"{lock_words(st)} Only the holder releases, and {name} isn't it")
     if token is None and "running" in st.lock:
-        raise ToolError(f"{name} holds the lock under a running command, whose take releases it when it ends")
+        if devlib.take_has_ended(st.lock["running"]) is not True:
+            raise ToolError(f"{name} holds the lock under a running command, whose take releases it when it ends. "
+                            "If that take is gone and this host can't see it, only dev break clears it, on the person's word")
+        print("dev: the take that held this lock under a command has ended, so this release goes ahead", file=sys.stderr)
     if token is not None and st.lock.get("made") != token:
         print(f"dev: the lock was broken or taken over while this ran, so it stays: {lock_words(st)}", file=sys.stderr)
         return
@@ -261,6 +268,9 @@ def join(a, cmd, config, device, st) -> int:
         raise ToolError("join refused, the lock stays with you: " + "; ".join(map(str, bad)))
     note(checks)
     lock = st.lock
+    if "running" in lock and devlib.take_has_ended(lock["running"]):
+        print(f"dev: the take that holds this lock under a command has ended, and nothing else will release it: "
+              f"dev release --as {a.name}", file=sys.stderr)
     held = [x for x in lock.get("does", "").split(",") if x]
     new = [x for x in a.actions if x not in held]
     go_table(new, a, config)
@@ -341,7 +351,7 @@ if ! mkdir lock.d 2>/dev/null; then [ -d lock.d ] && exit 10; exit 3; fi
 {write}
 printf '%s\\n' "$now" > lock.d/since
 printf '%s\\n' "$((now + {expect}))" > lock.d/expected_end
-{": > lock.d/running" if running else ":"}
+{put("lock.d/running", devlib.take_record(os.getpid())) if running else ":"}
 """
     done = device.run(script)
     if done.returncode not in (0, 10):

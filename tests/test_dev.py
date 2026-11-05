@@ -41,9 +41,14 @@ class FakeDevice:
 script=$(cat)
 printf '%s\\n----\\n' "$script" >> "$root/commands.log"
 [ -e "$root/unreachable" ] && exit 255
+[ -e "$root/hang" ] && exec sleep 5
 cd "$root"
 export PATH="$root/bin:$PATH"
-printf '%s\\n' "$script" | sh -s""")
+printf '%s\\n' "$script" | sh -s
+code=$?
+# lose-reply: strings, one a line. The first script holding one runs, and its answer never comes back
+if [ -s "$root/lose-reply" ] && printf '%s\\n' "$script" | grep -qF -f "$root/lose-reply"; then rm -f "$root/lose-reply"; exit 255; fi
+exit $code""")
         self.config()
         env["GLASSINE_DEV_SSH"] = str(self.root / "fake-ssh")
         env["GLASSINE_DEV_STORE"] = str(self.store)
@@ -225,6 +230,75 @@ def test_a_reboot_in_the_command_gets_a_while_before_the_release(rig):
     gone = rig.device.root / "unreachable"
     rig.take("a", cmd=["sh", "-c", f'touch "{gone}"; (sleep 1; rm "{gone}") >/dev/null 2>&1 &'])
     assert not rig.device.lock.exists()
+
+
+def test_a_device_that_hangs_after_the_command_is_tried_again(rig):
+    d = rig.device
+    d.config(release_tries=5, release_gap_seconds=1, ssh_seconds=1)
+    hang = d.root / "hang"
+    done = rig.take("a", cmd=["sh", "-c", f'touch "{hang}"; (sleep 2; rm "{hang}") >/dev/null 2>&1 &'])
+    assert "didn't answer" in done.stderr and not d.lock.exists()  # a timeout is a try used up, not the end of them
+
+
+def test_a_release_whose_reply_was_lost_is_not_a_failure(rig):
+    d = rig.device
+    d.config(release_tries=3)
+    (d.root / "lose-reply").write_text("mkdir -p history.d\n")  # the release lands, its answer doesn't
+    done = rig.take("a", cmd=["true"])
+    assert not (d.root / "lose-reply").exists(), "the fault never fired"
+    assert "may still be held" not in done.stderr and not d.lock.exists()
+
+
+def left_under_a_dead_take(rig):
+    """The device went away as CMD ended: the release failed and the lock stays, with its `running`."""
+    d = rig.device
+    rig.take("a", cmd=["touch", d.root / "unreachable"], code=1)
+    (d.root / "unreachable").unlink()
+    assert (d.lock / "running").exists()
+
+
+def test_a_lock_left_under_a_take_that_has_ended_is_released_by_its_name(rig):
+    left_under_a_dead_take(rig)
+    assert "has ended" in rig.dev("release", "--as", "a").stderr
+    assert not rig.device.lock.exists()
+
+
+def test_a_join_under_a_lock_whose_take_has_ended_says_so(rig):
+    left_under_a_dead_take(rig)
+    done = rig.take("a", cmd=["true"])
+    assert "has ended" in done.stderr and "dev release --as a" in done.stderr
+    assert rig.device.lock.exists()  # a join never releases
+
+
+@pytest.mark.parametrize("change,released", [
+    ({}, False),                         # the take is alive: a release inside its CMD
+    ({"host": "elsewhere"}, False),      # another host: this one can't see its processes
+    ({"ns": "pid:[1]"}, False),          # another pid namespace: the same
+    ({"start": "1"}, True),              # the pid is somebody else's now
+    ({"pid": "none"}, False),            # a record it can't read
+])
+def test_running_is_trusted_only_where_this_host_can_see_the_take_end(rig, change, released):
+    rig.take("a")
+    fields = devlib.parse_fields(devlib.take_record(os.getpid())) | change  # a live process: this test's own
+    (rig.device.lock / "running").write_text("".join(f"{k}: {v}\n" for k, v in fields.items()))
+    rig.dev("release", "--as", "a", code=0 if released else 1)
+    assert rig.device.lock.exists() != released
+
+
+def test_a_pid_that_is_gone_is_a_take_that_has_ended(rig):
+    rig.take("a")
+    child = subprocess.Popen(["true"])
+    fields = devlib.parse_fields(devlib.take_record(child.pid))
+    child.wait()
+    (rig.device.lock / "running").write_text("".join(f"{k}: {v}\n" for k, v in fields.items()))
+    rig.dev("release", "--as", "a")
+    assert not rig.device.lock.exists()
+
+
+def test_an_old_empty_running_file_still_refuses_a_release(rig):
+    rig.take("a")
+    (rig.device.lock / "running").write_text("")
+    assert "running command" in rig.dev("release", "--as", "a", code=1).stderr
 
 
 def test_by_hand_mkdir_blocks_and_status_says_owner_not_written(rig):

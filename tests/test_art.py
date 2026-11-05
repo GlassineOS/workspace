@@ -6,6 +6,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import artstore
 import wslib
 
@@ -335,3 +337,49 @@ def test_line_separator_characters_survive_the_manifest(ws):
     ws.art("rm", "b.bin", "--why", "room\x85now")
     assert ws.art("verify").stdout == ""
     assert entries(ws)[1]["tombstone"]["why"] == "room\x85now"
+
+
+needs_permissions = pytest.mark.skipif(os.geteuid() == 0, reason="root reads what mode 000 hides")
+
+
+@needs_permissions
+def test_rm_refuses_when_a_folder_cant_be_listed_even_with_a_retention(ws):
+    ws.add("a.bin")
+    (ws.old_tree / "sub").mkdir()
+    (ws.old_tree / "sub" / "ref.txt").write_text("a.bin\n")
+    (ws.old_tree / "sub").chmod(0o000)
+    try:
+        err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+        assert "couldn't be listed" in err and str(ws.old_tree / "sub") in err
+        assert "couldn't be listed" in ws.art("rm", "a.bin", "--why", "x", "--dry-run", code=1).stderr
+        assert "couldn't be listed" in ws.art("rm", "a.bin", "--why", "x", "--retention-said", "a.bin", "yes", code=1).stderr
+        assert entries(ws)[0]["tombstone"] is None
+    finally:
+        (ws.old_tree / "sub").chmod(0o700)
+    ws.art("rm", "a.bin", "--why", "x", "--dry-run", code=1)  # the reference is found once it can be read
+
+
+@needs_permissions
+def test_rm_refuses_when_a_whole_place_cant_be_listed(ws):
+    ws.add("a.bin")
+    (ws.old_tree / "ref.txt").write_text("a.bin\n")
+    ws.old_tree.chmod(0o000)
+    try:
+        assert "couldn't be listed" in ws.art("rm", "a.bin", "--why", "x", code=1).stderr
+    finally:
+        ws.old_tree.chmod(0o700)
+
+
+@needs_permissions
+def test_rm_names_the_files_it_couldnt_read_in_the_output_and_the_tombstone(ws):
+    ws.add("a.bin")
+    secret = ws.old_tree / "root-owned.log"
+    secret.write_text("a.bin\n")
+    secret.chmod(0o000)
+    try:
+        out = ws.art("rm", "a.bin", "--why", "x").stdout
+        assert "1 more unreadable" in out and f"not read: {secret}" in out
+    finally:
+        secret.chmod(0o600)
+    t = entries(ws)[0]["tombstone"]
+    assert t["search"]["unreadable"] == 1 and t["search"]["unreadable_paths"] == [str(secret)]

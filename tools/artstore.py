@@ -24,6 +24,7 @@ ID_LENGTH = 12
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
 _CHUNK = 1 << 20
 _MANIFEST = "manifest.jsonl"
+_LISTED = 100  # unreadable paths kept by name in a search's stats; the count is always whole
 
 # Where `art rm` looks for references, in the order they're read. Paths starting with / or ~ have
 # to exist, or the search can't be trusted and rm refuses. Paths relative to the workspace may not
@@ -269,9 +270,14 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
     pruned |= {Path(m) for m in _mounts()}
     overlap = len(needles.pattern)
     store = artifacts().resolve()
-    stats = {"places": [str(r) for r in roots], "files": 0, "binary": 0, "unreadable": 0}
+    stats = {"places": [str(r) for r in roots], "files": 0, "binary": 0, "unreadable": 0, "unreadable_paths": [],
+             "unlistable": []}
+
+    def unlistable(error: OSError) -> None:
+        stats["unlistable"].append(f"{error.filename}: {error.strerror}")
+
     for root in roots:
-        for directory, subdirs, files in os.walk(root, onerror=lambda _: stats.__setitem__("unreadable", stats["unreadable"] + 1)):
+        for directory, subdirs, files in os.walk(root, onerror=unlistable):
             at = Path(directory)
             subdirs[:] = [d for d in subdirs if d not in _NEVER_READ and at / d not in pruned]
             for name in files:
@@ -284,6 +290,8 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
                     found = _names_it(path, needles, overlap)
                 except OSError:
                     stats["unreadable"] += 1
+                    if len(stats["unreadable_paths"]) < _LISTED:
+                        stats["unreadable_paths"].append(str(path))
                     continue
                 stats["files"] += 1
                 if found is None:
@@ -324,6 +332,12 @@ def remove(ref: str, *, why: str, by: str, retention: tuple[str, str] | None = N
     folder, entry = resolve(ref)
     path = location(entry)
     hits, stats = search(entry, folder)
+    if stats["unlistable"]:  # like a missing place: a search that skipped a whole folder isn't a clear result
+        shown = stats["unlistable"][:10]
+        more = f"\n  and {len(stats['unlistable']) - len(shown)} more" if len(stats["unlistable"]) > len(shown) else ""
+        raise ToolError(f"can't search: {len(stats['unlistable'])} folders couldn't be listed, so no reference search can be "
+                        "trusted:\n" + "\n".join(f"  {u}" for u in shown) + more + "\nMake them readable, or take their place "
+                        "out of [art] search in workspace.toml. A retention decision doesn't lift this.")
     reasons = [] if not (reason := _protected(entry)) else [reason]
     reasons += [f"referenced by {hit}" for hit in hits]
     present = path.is_file()

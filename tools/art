@@ -69,6 +69,8 @@ def rm(a) -> int:
                              delete_in_place=a.delete_in_place, dry_run=a.dry_run)
     stats = report["search"]
     print(artstore.coverage(stats))
+    for path in stats["unreadable_paths"]:
+        print(f"  not read: {path}")
     for reason in report["reasons"]:
         print(f"  overriding: {reason}" if not a.dry_run else f"  {reason}")
     name = report["entry"]["name"]

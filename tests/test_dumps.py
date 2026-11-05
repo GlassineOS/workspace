@@ -209,6 +209,29 @@ def test_a_file_that_isnt_a_dump_is_stored_with_unknowns_and_says_so(ws):
     assert d["time_from"] == "file date"
 
 
+@pytest.mark.parametrize("rbbm", ["garbage", "", "-1", "0x", "1_000"])
+def test_a_bad_rbbm_status_stays_unknown(ws, rbbm):
+    assert "rbbm_status" not in record(ws, add(ws, rbbm=rbbm))["dump"]
+
+
+@pytest.mark.parametrize("time", ["nan", "inf", "-inf", "1e30", "garbage", ""])
+def test_a_bad_time_in_a_dump_stays_unknown(ws, time):
+    d = record(ws, add(ws, "--log", ws.file("dmesg", "x\n"), time=time))["dump"]
+    assert d["time_from"] == "file date"
+
+
+def test_a_header_with_no_value_stays_unknown(ws):
+    d = record(ws, add(ws, kernel="", comm=""))["dump"]
+    assert "kernel" not in d and "app" not in d
+
+
+@pytest.mark.parametrize("time", ["nan", "inf", "1e30", "whenever"])
+def test_a_bad_time_given_by_hand_is_refused_and_moves_nothing(ws, time):
+    dump = write_dump(ws)
+    err = ws.tool("dumps", "add", dump, "--mesa", "26.0", "--profile", "p", "--ran", "x", "--time", time, code=1).stderr
+    assert f"not a time: {time}" in err and "Traceback" not in err and dump.exists()
+
+
 def test_other_gpu_families_leave_the_registers_unknown(ws):
     assert "ib1_rem" not in record(ws, add(ws, revision="630 (06030000)"))["dump"]
 

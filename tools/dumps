@@ -53,6 +53,7 @@ EVENT_WINDOW = 30  # seconds
 A5XX_CP_IB1_BUFSZ = 0xb21
 A5XX_CP_IB2_BUFSZ = 0xb24
 _HEADER = re.compile(r"(kernel|time|comm|cmdline|revision|rbbm-status): (.*)")
+_HEX = re.compile(r"(?:0x)?[0-9a-fA-F]+")
 _REGISTER = re.compile(r"\s+- \{ offset: 0x([0-9a-f]+), value: 0x([0-9a-f]+) \}")
 # Wording read from the kernel's source, not from a captured log. The kernel prints -1 for "no such ring".
 _PREEMPT = re.compile(r"\bnext rb -?\d+, preempt state (-?\d+)")
@@ -64,6 +65,16 @@ def _kernel_says(line: str, said: dict[str, set[int]]) -> None:
     for field, pattern in (("ring", _BLAMED), ("preempt_state", _PREEMPT)):
         if (m := pattern.search(line)) and (value := int(m[1])) >= 0:
             said.setdefault(field, set()).add(value)
+
+
+def _seconds(text: str) -> float | None:
+    """Seconds since the epoch, or None if a date can't be made of them: not a number, nan, inf, 1e30."""
+    try:
+        seconds = float(text)
+        wslib.utc(seconds)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return seconds
 
 
 def parse_dump(path: Path) -> tuple[dict, dict[str, set[int]]]:
@@ -83,19 +94,17 @@ def parse_dump(path: Path) -> tuple[dict, dict[str, set[int]]]:
                 registers.setdefault(int(m[1], 16) // 4, int(m[2], 16))
             elif len(line) < 500:  # not an encoded buffer
                 _kernel_says(line, said)
-    if "rbbm-status" in header:
+    if _HEX.fullmatch(header.get("rbbm-status", "")):
         found["rbbm_status"] = f"0x{int(header['rbbm-status'], 16):08x}"
     if header.get("revision", "").startswith("5"):
         for key, register in (("ib1_rem", A5XX_CP_IB1_BUFSZ), ("ib2_rem", A5XX_CP_IB2_BUFSZ)):
             if register in registers:
                 found[key] = f"0x{registers[register]:x}"
     for key, into in (("kernel", "kernel"), ("comm", "app"), ("cmdline", "cmdline"), ("revision", "revision")):
-        if key in header:
+        if header.get(key, "").strip():
             found[into] = header[key]
-    try:
-        found["time"] = float(header["time"])
-    except (KeyError, ValueError):
-        pass
+    if (seconds := _seconds(header.get("time", ""))) is not None:
+        found["time"] = seconds
     return found, said
 
 
@@ -103,13 +112,11 @@ def _when(text: str | None) -> float | None:
     """A time given by hand: seconds since the epoch, or ISO 8601."""
     if not text:
         return None
-    try:
-        return float(text)
-    except ValueError:
-        pass
+    if (seconds := _seconds(text)) is not None:
+        return seconds
     try:
         return datetime.fromisoformat(text).timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         raise ToolError(f"not a time: {text}") from None
 
 

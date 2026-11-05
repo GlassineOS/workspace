@@ -9,7 +9,7 @@
   art verify [NAME...]                                   hash files against the manifests
   art rm NAME|ID --why WORDS [--dry-run] [--delete-in-place] [--retention-said NAME WORDS]
 
-FOLDER: dumps bases images captures bench vendor. C: ours vendor user-data derived.
+FOLDER: dumps bases images captures bench vendor repro. C: ours vendor user-data derived.
 K: always, user, or a date (YYYY-MM-DD) until which it's kept.
 
 --in-place indexes a file where it is, without moving it. art rm of such an entry leaves the file

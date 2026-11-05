@@ -10,7 +10,8 @@ repository's own `CLAUDE.md` loads when you read its files, and applies inside i
 | `<repo>/` | main checkout (`.github` lives in `github/`) | Stays on its default branch and clean. Read it, don't work in it. |
 | `work/<task>/<repo>/` | your worktrees | All edits, builds and commits happen here. |
 | `tools/` | the workspace's own tools, beside `ws` | Run them from any checkout. |
-| `artifacts/` | dumps, bases, images, captures, bench, vendor files, each with a `manifest.jsonl` | Ignored, on this host only. Goes through `art`. |
+| `repro/` | reproducers, each a folder with a `repro.toml` | Code only: their results go to `artifacts/repro`. |
+| `artifacts/` | dumps, bases, images, captures, bench, repro results, vendor files, each with a `manifest.jsonl` | Ignored, on this host only. Goes through `art`. |
 | `~/.cache/glassine/` | build output, kernel objects, downloads: what can be rebuilt | Anything may delete it. Nothing may point into it. |
 
 Lab notes and firmware still live outside this tree, in the lab directory, until they're indexed.
@@ -55,6 +56,8 @@ tools/dev take --as NAME --purpose WORDS --expect 30m -- CMD     # the device lo
 tools/dev release --as NAME                                      # without CMD it's held until this
 tools/dev wait --as NAME --on WORDS --until 2h                   # queue; tools/dev ready --as NAME when they're met
 tools/dev status                                                 # asks the device; also notice, stamp, break
+tools/repro run NAME --as NAME                                   # under the lock, --does from repro.toml, result in artifacts/repro
+tools/repro gate BASE --patches DIR                              # what's missing or failed; runs nothing
 ```
 
 - **Only the person overrides retention.** `art rm` refuses a file with `keep: user` or `always`, before a keep
@@ -71,6 +74,9 @@ tools/dev status                                                 # asks the devi
   from your apps: don't save them in a checkout. The scan only catches patterns, so tools write results to the right
   place themselves. Our own measured numbers may stay in a comment or commit message where they justify a default.
 - A test with a private input reports "skipped: no private input", never a pass.
+- **A reproducer's `does` comes from its `repro.toml`,** so a run can't start under a go that doesn't cover what it
+  does. Its result names the base the device stamped, and warns when that isn't the base you said, when the binary differs
+  from earlier results there, or when something is bound over a live binary. A bound binary isn't the base's own.
 
 **Writing a tool:** Python 3, standard library only, an executable with no extension in `tools/`, and the SPDX header
 like `ws`. `tools/wslib.py` finds `artifacts/` and `notes/` from `~/GlassineOS`, so it works from a worktree;

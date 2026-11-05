@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Reproducers: the source, how to run it and what counts as a pass are code; what it showed is a result.
+
+  repro list
+  repro check [NAME...]                  are the definitions sound? Reads no device and runs nothing
+  repro run NAME --as WHO [--go ID | --go-said WORDS] [--dirty WHY] [--ahead WHY] [--base BASE] [--binary-file F]
+  repro gate BASE [--patches FILE|DIR] [--patch NAME]... [--json]
+
+repro/<name>/repro.toml:
+
+  what = "one line"
+  expect = "20m"                    how long the lock is asked for
+  does = ["close-apps"]             named actions, which go to dev take --does and so need a go
+  needs = ["a paired pen"]          what has to be so, in words, shown before it runs
+  fixes = ["0042-some.patch"]       the patches this proves, for repro gate
+  device = false                    only for what never touches the device: no lock, no stamp, --base needed
+
+  [source]                          one of:
+  file = "run.sh"                   in this folder
+  artifact = "<id>"                 private, as made from a captured stream. Not here: "skipped", exit 77, no result
+
+  [run]
+  where = "device"                  the source goes to the device's sh, through dev's ssh command. Or:
+  where = "host"                    command runs here, with GLASSINE_DEV_SSH to reach the device
+  command = ["python3", "{source}"] {source} is the source's path, {dir} the reproducer's folder (host only)
+  timeout = "15m"
+  binary = "compositor"             what it tests: compositor, daemon or boot_image, from dev stamp
+
+  [pass]
+  exit = 0                          default 0
+  output_has = "regex"              each is optional
+  output_lacks = "regex"
+
+run takes the lock through dev (or joins it, if WHO holds it), with --does from repro.toml, records dev stamp
+and the source's and binary's hashes, and stores the result in artifacts/repro with the base from the stamp.
+The output goes to a log there, not to the terminal. It warns on a base other than --base, on a binary other
+than earlier results on that base had, and on anything bound over a live binary. Exit: 0 pass, 1 fail, 77 skipped.
+
+gate lists what's missing or failed for a base, from results alone, and runs nothing. A patch named with
+--patches or --patch that no reproducer's fixes names gets a "no reproducer" row. Exit 1 on missing or failed;
+a "no reproducer" row is a statement about an old patch, and warnings are warnings: neither fails it.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import artstore  # noqa: E402
+import devlib  # noqa: E402
+import kitlib  # noqa: E402
+import wslib  # noqa: E402
+from wslib import ToolError  # noqa: E402
+
+KEYS = {"what", "expect", "does", "needs", "fixes", "device", "source", "run", "pass"}
+
+
+def load(name: str) -> dict:
+    table, folder = kitlib.read_toml("repro", name)
+    where = f"repro/{name}"
+    kitlib.strict(table, KEYS, where)
+    common = kitlib.check_common(table, where)
+    source = kitlib.check_source(table, where)
+    run = kitlib.check_run(table, where, common["device"])
+    if run["where"] == "device" and "file" in source and (folder / source["file"]).is_file():
+        kitlib.check_device_script(folder / source["file"], where)
+    criterion = table.get("pass", {})
+    kitlib.strict(criterion, {"exit", "output_has", "output_lacks"}, f"{where} [pass]")
+    if not isinstance(criterion.get("exit", 0), int):
+        raise ToolError(f"{where}: [pass] exit is a number")
+    for key in ("output_has", "output_lacks"):
+        if key in criterion:
+            try:
+                re.compile(criterion[key])
+            except (re.error, TypeError) as e:
+                raise ToolError(f"{where}: [pass] {key}: {e}") from None
+    return {**common, "name": name, "where": where, "folder": folder, "what": table["what"], "source": source, "run": run,
+            "pass": criterion, "fixes": kitlib.words_list(table, "fixes", where)}
+
+
+def judge(r: dict, ran: kitlib.Ran, output: str) -> tuple[str, str]:
+    """pass or fail, and why. A run stopped from outside is neither: the caller stores it as stopped."""
+    if ran.timed_out:
+        return "fail", f"timed out after {r['run']['timeout']}"
+    want = r["pass"].get("exit", 0)
+    if ran.code != want:
+        return "fail", f"exit {ran.code}, wanted {want}"
+    has, lacks = r["pass"].get("output_has"), r["pass"].get("output_lacks")
+    if has and not re.search(has, output, re.M):
+        return "fail", f"output doesn't have {has}"
+    if lacks and re.search(lacks, output, re.M):
+        return "fail", f"output has {lacks}"
+    return "pass", "as the criterion says"
+
+
+def earlier(name: str, base: str) -> list[dict]:
+    entries = [e for e in artstore.read("repro") if not e.get("tombstone") and e.get("repro", {}).get("reproducer") == name
+               and e["repro"].get("base") == base]
+    return sorted(entries, key=lambda e: e["made"])
+
+
+def warnings(r, a, stamp, base, binary) -> list[str]:
+    out = []
+    if a.base and stamp.get("base") and not str(stamp["base"]).startswith("unknown") and stamp["base"] != a.base:
+        out.append(f"--base {a.base}, but the device says {stamp['base']}: the result goes under what the device says")
+    if base == "unknown":
+        out.append("the base isn't known, so repro gate can't count this result: set the base probe, or --base")
+    if stamp.get("bound"):
+        out.append("bound over a live binary, so this isn't the base's own: " + ", ".join(sorted(map(str, stamp["bound"].values()))))
+    if stamp.get("dirty"):
+        out.append(f"the device was dirty: {stamp['dirty']}")
+    if r["run"].get("binary") and not binary:
+        out.append(f"{r['run']['binary']}: no hash from the stamp, so nothing to compare")
+    for e in earlier(r["name"], base):
+        other = e["repro"].get("binary_sha256")
+        if other and binary and other != binary:
+            out.append(f"binary {binary[:12]}, but result {e['id']} on this base ran {other[:12]}")
+            break
+    return out
+
+
+def inside(a) -> int:
+    """Under the lock when there is one: the stamp, the run, the result."""
+    r = load(a.reproducer)
+    source = kitlib.resolve_source(r["source"], r["folder"], r["where"])
+    stamp = kitlib.stamp() if r["device"] else {"device": None}
+    base = kitlib.stamped(stamp, "base") or a.base or "unknown"
+    if a.binary_file:
+        binary = artstore.digest(Path(a.binary_file))
+    else:
+        binary = kitlib.binary_hash(stamp, r["run"].get("binary"))
+    notes = warnings(r, a, stamp, base, binary)
+    for note in notes:
+        print(f"repro: warning: {note}", file=sys.stderr)
+    commit, changed = kitlib.kit_commit()
+    name = kitlib.result_name("repro", r["name"])
+    seconds = kitlib.duration(r["run"]["timeout"], r["where"])
+    with kitlib.scratch("repro") as where:
+        log = Path(where) / "output"
+        if r["run"]["where"] == "device":
+            config = devlib.load_config()
+            kitlib.check_device_script(source, r["where"])
+            ran = kitlib.run_bounded([*devlib.Device(config).argv, "sh -s"], log, stdin=source.read_bytes(), seconds=seconds)
+        else:
+            fill = {"{source}": str(source), "{dir}": str(r["folder"])}
+            argv = [fill.get(x, x) for x in r["run"]["command"]]
+            env = {**os.environ}
+            if r["device"]:
+                env["GLASSINE_DEV_SSH"] = devlib.load_config().ssh
+            ran = kitlib.run_bounded(argv, log, seconds=seconds, env=env, cwd=r["folder"])
+        log.touch()
+        output = log.read_text(errors="replace")
+        result, why = ("stopped", "stopped from outside") if ran.stopped else judge(r, ran, output)
+        log_id = kitlib.store_log(log, "repro", name, f"output of reproducer {r['name']} on {base}", a.by)
+    inputs = [r["source"]["artifact"]] if "artifact" in r["source"] else []
+    record = {"reproducer": r["name"], "base": base, "result": result, "why": why, "exit": ran.code, "seconds": ran.seconds,
+              "binary": r["run"].get("binary"), "binary_sha256": binary, "source_sha256": artstore.digest(source), "inputs": inputs,
+              "fixes": r["fixes"], "does": r["does"], "kit_commit": commit, "kit_changed": changed, "by": a.name or a.by,
+              "time": wslib.utc(), "stamp": stamp, "warnings": notes, "log": log_id}
+    summary = {k: record[k] for k in ("reproducer", "base", "result", "binary_sha256", "source_sha256", "warnings")}
+    entry = kitlib.store_result(record, "repro", name, f"reproducer {r['name']} on {base}: {result}", a.by, "repro", summary)
+    print(f"{r['name']}: {result}: {why}. Result {entry['id']}, on {base}, in {ran.seconds} s")
+    return 0 if result == "pass" else 1
+
+
+def run(a) -> int:
+    r = load(a.reproducer)
+    if r["device"] and not a.name:
+        raise ToolError("--as: this needs the device, and so the lock")
+    if not r["device"] and not a.base:
+        raise ToolError("--base: this doesn't touch the device, so nothing else says what it ran on")
+    kitlib.resolve_source(r["source"], r["folder"], r["where"])  # a missing private input stops it before any lock
+    for need in r["needs"]:
+        print(f"repro: needs: {need}", file=sys.stderr)
+    inner = [sys.executable, str(Path(__file__).resolve()), "_inside", a.reproducer, "--by", a.by]
+    for flag, value in (("--as", a.name), ("--base", a.base), ("--binary-file", a.binary_file)):
+        if value:
+            inner += [flag, value]
+    if not r["device"]:
+        return subprocess.run(inner).returncode
+    # the lock's exit status decides, with the run chained on it. A take by the holder joins and frees nothing.
+    return subprocess.run([*kitlib.take_argv(a.name, f"repro {a.reproducer}", a, r["does"], r["expect"]), "--", *inner]).returncode
+
+
+def patches_from(a) -> list[str]:
+    found = list(a.patch or [])
+    if a.patches:
+        path = Path(a.patches)
+        if path.is_dir():
+            found += sorted(p.name for p in path.iterdir() if p.suffix == ".patch")
+        elif path.is_file():
+            found += [s for s in map(str.strip, path.read_text().splitlines()) if s and not s.startswith("#")]
+        else:
+            raise ToolError(f"--patches {a.patches}: neither a file nor a folder")
+    return found
+
+
+def gate_rows(base: str, patches: list[str]) -> list[dict]:
+    rows, covered = [], set()
+    for name in kitlib.names("repro"):
+        r = load(name)
+        covered.update(r["fixes"])
+        results = earlier(name, base)
+        if not results:
+            rows.append({"reproducer": name, "state": "missing", "words": "no result on this base", "warnings": []})
+            continue
+        last = results[-1]
+        state = last["repro"]["result"]
+        notes = list(last["repro"].get("warnings", []))
+        hashes = {e["repro"]["binary_sha256"] for e in results if e["repro"].get("binary_sha256")}
+        if len(hashes) > 1:
+            notes.append(f"results on this base ran {len(hashes)} different binaries")
+        rows.append({"reproducer": name, "state": "failed" if state != "pass" else "pass", "words": f"{state}, result {last['id']}, {last['made']}",
+                     "warnings": notes, "result": last["id"]})
+    for patch in patches:
+        if patch not in covered:
+            rows.append({"patch": patch, "state": "no reproducer", "words": "no repro.toml names this patch in fixes", "warnings": []})
+    return rows
+
+
+def gate(a) -> int:
+    rows = gate_rows(a.base, patches_from(a))
+    if a.json:
+        print(json.dumps({"base": a.base, "rows": rows}, ensure_ascii=False))
+    else:
+        for row in rows:
+            print(f"{row['state']:<14} {row.get('reproducer') or row['patch']}: {row['words']}")
+            for note in row["warnings"]:
+                print(f"{'':<14}   warning: {note}")
+        if not rows:
+            print(f"nothing to list for {a.base}: no reproducers, no patches named")
+    return 1 if any(row["state"] in ("missing", "failed") for row in rows) else 0
+
+
+def check(a) -> int:
+    bad = 0
+    for name in a.names or kitlib.names("repro"):
+        try:
+            load(name)
+            print(f"{name}: sound")
+        except ToolError as e:
+            bad += 1
+            print(e, file=sys.stderr)
+    return 1 if bad else 0
+
+
+def listing(_a) -> int:
+    for name in kitlib.names("repro"):
+        r = load(name)
+        print(f"{name}  {r['what']}" + (f"  (does: {', '.join(r['does'])})" if r["does"] else ""))
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="repro", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("list")
+    sub.add_parser("check").add_argument("names", nargs="*")
+    r = sub.add_parser("run")
+    r.add_argument("reproducer")
+    kitlib.add_take_flags(r)
+    r.add_argument("--base")
+    r.add_argument("--binary-file")
+    r.add_argument("--by", default=getpass.getuser())
+    i = sub.add_parser("_inside")
+    i.add_argument("reproducer")
+    i.add_argument("--as", dest="name")
+    i.add_argument("--base")
+    i.add_argument("--binary-file")
+    i.add_argument("--by", default=getpass.getuser())
+    g = sub.add_parser("gate")
+    g.add_argument("base")
+    g.add_argument("--patches", metavar="FILE|DIR")
+    g.add_argument("--patch", action="append")
+    g.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    try:
+        return {"list": listing, "check": check, "run": run, "_inside": inside, "gate": gate}[a.command](a)
+    except kitlib.Skipped as e:
+        print(f"repro: {e}")
+        return kitlib.SKIPPED
+
+
+if __name__ == "__main__":
+    raise SystemExit(wslib.run("repro", main))

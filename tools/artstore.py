@@ -18,7 +18,7 @@ from pathlib import Path
 
 from wslib import ToolError, artifacts, home, locked, private_dir, utc
 
-FOLDERS = ("dumps", "bases", "images", "captures", "bench", "vendor")
+FOLDERS = ("dumps", "bases", "images", "captures", "bench", "vendor", "repro")
 CLASSES = ("ours", "vendor", "user-data", "derived")
 ID_LENGTH = 12
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")

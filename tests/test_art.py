@@ -2,8 +2,10 @@
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -403,3 +405,46 @@ def test_a_symlink_to_the_artifact_is_a_reference_and_is_never_opened(ws):
     (ws.old_tree / "hop").unlink()
     (ws.old_tree / "unrelated").symlink_to(ws.tmp / "nowhere")  # dangling, and nothing to do with it
     ws.art("rm", "a.bin", "--why", "no link left")
+
+
+def elsewhere_device(ws):
+    """A temporary folder on another file system than the workspace, or skip."""
+    for candidate in ("/dev/shm", "/run/user/%d" % os.getuid(), "/var/tmp"):
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK) and os.stat(candidate).st_dev != ws.tmp.stat().st_dev:
+            return Path(tempfile.mkdtemp(dir=candidate))
+    pytest.skip("no writable folder on another file system")
+
+
+def test_a_move_across_file_systems_leaves_no_source_behind(ws):
+    other = elsewhere_device(ws)
+    try:
+        src = other / "c.bin"
+        src.write_text("across\n")
+        src.chmod(0o755)
+        ws.art("add", src, "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user")
+        assert not src.exists()
+        stored = Path(ws.art("path", "c.bin").stdout.strip())
+        assert stored.read_text() == "across\n" and os.access(stored, os.X_OK)
+        assert ws.art("verify").stdout == ""
+        copied = other / "d.bin"
+        copied.write_text("kept\n")
+        ws.art("add", copied, "--copy", "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user")
+        assert copied.exists()
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+@needs_permissions
+def test_a_move_that_cant_remove_its_source_stores_nothing(ws):
+    other = elsewhere_device(ws)
+    try:
+        src = other / "c.bin"
+        src.write_text("stuck\n")
+        other.chmod(0o500)  # the original can be copied but not removed
+        err = ws.art("add", src, "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user", code=1).stderr
+        assert "can't be removed" in err
+        assert src.exists() and not (ws.artifacts / "bases" / "manifest.jsonl").exists()
+        assert ws.art("verify").stdout == ""  # no store copy left behind
+    finally:
+        other.chmod(0o700)
+        shutil.rmtree(other, ignore_errors=True)

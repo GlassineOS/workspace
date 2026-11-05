@@ -133,6 +133,12 @@ def _store(source: Path, into: Path, sha256: str, copy: bool) -> None:
             temporary.unlink()
             raise ToolError(f"copying {source} gave different content, nothing was stored")
         os.rename(temporary, into)
+        if not copy:  # a move leaves nothing behind: the store copy was verified above
+            try:
+                source.unlink()
+            except OSError as e:
+                into.unlink()  # one copy, where it was, rather than two
+                raise ToolError(f"couldn't move {source}: its copy was verified but the original can't be removed: {e}") from None
     into.chmod(0o500 if executable else 0o400)
 
 

@@ -44,6 +44,12 @@ def check_keep(keep: str) -> str:
         raise ToolError(f"keep is always, user or a date as YYYY-MM-DD, not {keep}") from None
 
 
+def check_name(name: str) -> str:
+    if not _NAME.fullmatch(name):
+        raise ToolError(f"not a name: {name}")
+    return name
+
+
 def _manifest(folder: str) -> Path:
     return artifacts() / folder / _MANIFEST
 
@@ -186,6 +192,16 @@ def _store(source: Path, into: Path, sha256: str, copy: bool) -> None:
     into.chmod(0o500 if executable else 0o400)
 
 
+def check_source(source: Path, in_place: bool = False) -> Path:
+    """What add refuses in a file, for a caller that stores two things and has to know before the first."""
+    if source.is_symlink() or not source.is_file():
+        raise ToolError(f"not a regular file: {source}")
+    source = source.resolve()
+    if in_place and source.is_relative_to((Path.home() / ".cache" / "glassine").resolve()):
+        raise ToolError("nothing may point into the build cache: anything may delete it")
+    return source
+
+
 def add(source: Path, folder: str, *, name: str | None, cls: str, what: str, keep: str, by: str,
         sources: list[str] = (), parent_base: str | None = None, made: str | None = None, in_place: bool = False,
         copy: bool = False, extra: dict | None = None) -> tuple[dict, bool]:
@@ -198,14 +214,8 @@ def add(source: Path, folder: str, *, name: str | None, cls: str, what: str, kee
     if not what.strip():
         raise ToolError("say what it is: what can't be empty")
     keep = check_keep(keep)
-    name = name or source.name
-    if not _NAME.fullmatch(name):
-        raise ToolError(f"not a name: {name}")
-    if source.is_symlink() or not source.is_file():
-        raise ToolError(f"not a regular file: {source}")
-    source = source.resolve()
-    if in_place and source.is_relative_to((Path.home() / ".cache" / "glassine").resolve()):
-        raise ToolError("nothing may point into the build cache: anything may delete it")
+    name = check_name(name or source.name)
+    source = check_source(source, in_place)
     sha256 = digest(source)
     entry = {"id": sha256[:ID_LENGTH], "name": name, "path": None, "sha256": sha256, "size": source.stat().st_size,
              "class": cls, "what": what, "made": made or utc(source.stat().st_mtime), "by": by,

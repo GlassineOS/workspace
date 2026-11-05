@@ -573,6 +573,12 @@ def test_no_script_ever_names_run_even_with_a_real_fifo_there(rig):
     run_everything(rig)  # each run is bounded: a read of the FIFO would fail on the timeout
     for script in rig.device.log.read_text().split("\n----\n"):
         assert not re.search(r"(^|[\s'\"=:(])(/var)?/run\b", script), script
+        assert not devlib.touches_run(script), script  # the config's own test too, so the two can't drift apart
+
+
+def test_the_default_probes_never_name_run():
+    # the fake device's dev.toml overrides some of them, so the scan of its scripts never sees these
+    assert not any(devlib.touches_run(command) for command in devlib.DEFAULT_PROBES.values()), devlib.DEFAULT_PROBES
 
 
 def test_a_fifo_in_the_store_doesnt_block_a_read(rig):

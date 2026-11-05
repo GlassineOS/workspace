@@ -12,7 +12,8 @@
   dumps decoder FILE --mesa V [--image IMG] [--keep K] [--in-place | --copy]
 
 --mesa and --profile are those of the process that faulted: a Flatpak app doesn't load the system's.
-Say "unknown" rather than guess. Ring and preempt state are read from the dump and --log if they say.
+Say "unknown" rather than guess. Ring and preempt state are read from the dump and --log if they say. If those give
+more than one value for either, as a log with two faults does, it stays unknown and the flag has to say.
 
 A decoder is an artifact named crashdec-mesa-V, found through `art path`. show picks the one with the
 dump's Mesa version, or refuses. --image runs it in that container, for a binary built on another libc.
@@ -59,15 +60,15 @@ _PREEMPT = re.compile(r"\bnext rb -?\d+, preempt state (-?\d+)")
 _BLAMED = re.compile(r"\b(?:gpu fault ring|lockup rb) (-?\d+)")
 
 
-def _kernel_says(line: str, found: dict) -> None:
+def _kernel_says(line: str, said: dict[str, set[int]]) -> None:
     for field, pattern in (("ring", _BLAMED), ("preempt_state", _PREEMPT)):
         if (m := pattern.search(line)) and (value := int(m[1])) >= 0:
-            found.setdefault(field, value)
+            said.setdefault(field, set()).add(value)
 
 
-def parse_dump(path: Path) -> dict:
-    """What a devcoredump says about itself. A field it doesn't have stays out, never a guess."""
-    header, registers, found = {}, {}, {}
+def parse_dump(path: Path) -> tuple[dict, dict[str, set[int]]]:
+    """What a devcoredump says about itself, and the kernel's lines in it. A field it doesn't have stays out, never a guess."""
+    header, registers, found, said = {}, {}, {}, {}
     in_registers = False
     with open(path, errors="replace") as f:
         for line in f:
@@ -81,7 +82,7 @@ def parse_dump(path: Path) -> dict:
             elif in_registers and (m := _REGISTER.match(line)):
                 registers.setdefault(int(m[1], 16) // 4, int(m[2], 16))
             elif len(line) < 500:  # not an encoded buffer
-                _kernel_says(line, found)
+                _kernel_says(line, said)
     if "rbbm-status" in header:
         found["rbbm_status"] = f"0x{int(header['rbbm-status'], 16):08x}"
     if header.get("revision", "").startswith("5"):
@@ -95,7 +96,7 @@ def parse_dump(path: Path) -> dict:
         found["time"] = float(header["time"])
     except (KeyError, ValueError):
         pass
-    return found
+    return found, said
 
 
 def _when(text: str | None) -> float | None:
@@ -138,17 +139,17 @@ def _event_for(a, record: dict, own_id: str) -> str:
 def add_gpu(a) -> int:
     if not a.file.is_file():
         raise ToolError(f"not a file: {a.file}")
-    found = parse_dump(a.file)
+    found, said = parse_dump(a.file)
     logged = None
     if a.log:
         if not a.log.is_file():
             raise ToolError(f"not a file: {a.log}")
-        said: dict = {}
         with open(a.log, errors="replace") as f:
             for line in f:
                 _kernel_says(line, said)
-        found = {**said, **found}
         logged = f"log-{artstore.digest(a.log)[:artstore.ID_LENGTH]}"
+    # Nothing ties a log line to this dump: a log can hold two faults. One value can be believed, two can't.
+    found.update({field: next(iter(values)) for field, values in said.items() if len(values) == 1})
     own_id = artstore.digest(a.file)[:artstore.ID_LENGTH]
     record = {"kind": "gpu", **found, "ran": a.ran, "mesa": a.mesa, "profile": a.profile}
     for key, value in (("app", a.app), ("kernel", a.kernel), ("ring", a.ring), ("preempt_state", a.preempt_state),
@@ -163,7 +164,7 @@ def add_gpu(a) -> int:
         record["log"] = logged
         artstore.add(a.log, "dumps", name=logged, cls="user-data", what=f"kernel log around GPU fault {own_id}",
                      keep=a.keep, by=a.by, copy=True, extra={"dump": {"kind": "gpu-log"}})
-    missing = [k for k in ("rbbm_status", "ib1_rem", "ring", "preempt_state") if k not in record]
+    missing = [k for k in ("rbbm_status", "ib1_rem", "ring", "preempt_state") if k not in record and k not in said]
     what = f"GPU fault: {record.get('app', 'unknown app')} on {record.get('kernel', 'unknown kernel')}"
     entry, new = artstore.add(a.file, "dumps", name=f"gpu-{own_id}", cls="user-data", what=what, keep=a.keep, by=a.by,
                               sources=[logged] if logged else [], made=wslib.utc(record["time"]), in_place=a.in_place,
@@ -176,6 +177,10 @@ def add_gpu(a) -> int:
         print(f"linked as one event with {record['event']}")
     if missing:
         print(f"not in the dump or log, so unknown in its fingerprint: {', '.join(missing)}", file=sys.stderr)
+    for field, values in said.items():
+        if field not in record:
+            print(f"the dump and log give more than one {field} ({', '.join(map(str, sorted(values)))}), so it's unknown "
+                  f"in its fingerprint: --{field.replace('_', '-')} says which", file=sys.stderr)
     return 0
 
 

@@ -102,6 +102,33 @@ def test_a_ring_of_minus_one_is_unknown(ws):
     assert "ring=unknown" in ws.tool("dumps", "group").stdout
 
 
+def test_a_log_with_two_faults_leaves_what_they_disagree_on_unknown_and_says_so(ws):
+    log = ws.file("dmesg", PREEMPT_LINE.format(hw=0, cur=0, next=-1, state=1) + FAULT_LINE.format(ring=0)
+                  + PREEMPT_LINE.format(hw=2, cur=2, next=-1, state=3) + FAULT_LINE.format(ring=2))
+    done = ws.tool("dumps", "add", write_dump(ws), "--mesa", "26.0", "--profile", "short", "--ran", "x", "--log", log)
+    d = record(ws, done.stdout.strip())["dump"]
+    assert "ring" not in d and "preempt_state" not in d
+    assert "more than one ring (0, 2)" in done.stderr and "--ring says which" in done.stderr
+    assert "more than one preempt_state (1, 3)" in done.stderr and "--preempt-state says which" in done.stderr
+
+
+def test_a_lockup_and_a_later_fault_on_another_ring_dont_mix(ws):
+    d = logged(ws, "a5xx: hangcheck detected gpu lockup rb 1!\n" + PREEMPT_LINE.format(hw=2, cur=2, next=0, state=3) + FAULT_LINE.format(ring=2))
+    assert "ring" not in d and d["preempt_state"] == 3
+
+
+def test_a_value_repeated_in_a_log_is_one_value(ws):
+    line = PREEMPT_LINE.format(hw=2, cur=2, next=-1, state=3)
+    d = logged(ws, line + FAULT_LINE.format(ring=2) + line)
+    assert (d["ring"], d["preempt_state"]) == (2, 3)
+
+
+def test_a_flag_settles_what_a_log_disagrees_on(ws):
+    log = ws.file("dmesg", FAULT_LINE.format(ring=0) + FAULT_LINE.format(ring=2))
+    done = ws.tool("dumps", "add", write_dump(ws), "--mesa", "26.0", "--profile", "short", "--ran", "x", "--log", log, "--ring", "2")
+    assert record(ws, done.stdout.strip())["dump"]["ring"] == 2 and "more than one ring" not in done.stderr
+
+
 def test_mesa_profile_and_what_ran_are_required(ws):
     path = write_dump(ws)
     for missing in (["--profile", "p", "--ran", "r"], ["--mesa", "m", "--ran", "r"], ["--mesa", "m", "--profile", "p"]):

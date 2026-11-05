@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""The device lock and state. Nothing here needs the hub: the device's plain files decide.
+
+  dev take --as NAME --purpose WORDS --expect 30m [--does a,b] [--go ID | --go-said WORDS]
+           [--dirty WHY] [--ahead WHY] [--keep] [-- CMD...]
+  dev release --as NAME [--left STATE WHY]
+  dev wait --as NAME --on CONDITIONS --until TIME [--for WORDS]   |   dev wait --as NAME --drop
+  dev ready --as NAME
+  dev notice [--as NAME] WORDS
+  dev stamp [--json]
+  dev status [--json]
+  dev break --why WORDS [--as NAME]
+
+take: mkdir decides, exit status only. CMD runs on this host, chained on success, and the lock is
+released when it ends, unless --keep. Without CMD it's held until dev release --as NAME. The order is
+mkdir, the queue, the device check, then the hub, and any refusal gives the lock back. A take by the
+current holder joins: it never releases or gives back, and a failed check fails only that command.
+
+break is for a dead holder, only on the person's word. It keeps the old record in history.d.
+
+--does needs a go. --go ID is asked of the hub, and with the hub down the answer is "unknown": refused. A take that
+gets through spends a run of its go, and so does a join that names actions the lock doesn't hold yet; actions it holds
+cost nothing again.
+--go-said is for words the person typed to this session, in its live conversation, for its next lock:
+never a relay, a briefing or restored history. Compaction or Resume ends them. Nothing proves them,
+so they go in the lock record, with the actions.
+
+TIME: a duration (90m, 2h) or YYYY-MM-DDTHH:MMZ, on the device's clock.
+
+On the device, in the store folder, by hand over ssh too:
+
+  lock.d/               mkdir's exit status decides. owner purpose since expected_end does go dirty notice
+  queue.d/<time>-<who>  who: for: on: until: ready:          (<time> and until in the device's seconds)
+  overrides.d/<name>    owner: boot_id: value: remove: survives_reboot: removed: target: setting:
+  left.d/<state>        owner: why: since:
+  history.d/            old lock records: released and broken
+
+Settings: dev.toml in the workspace, ignored by git (see DEFAULTS in devlib.py, [probes] for commands).
+GLASSINE_DEV_SSH and GLASSINE_DEV_STORE override it. ssh has no default: give it here or there. Never give it anything under /run: dev refuses a setting or probe
+that names it, but that is a tripwire for a slip (odd spellings get past it), not a guarantee.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import devlib  # noqa: E402
+import wslib  # noqa: E402
+from devlib import put, word  # noqa: E402
+from wslib import ToolError  # noqa: E402
+
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# You can hold the device while a session holds the lock for an eye test: "I've got the device" doesn't refuse it.
+WHILE_YOU_HOLD = {"eye-test"}
+
+
+class Stop(BaseException):
+    """A signal arrived outside CMD: give the lock back on the way out."""
+
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def name_of(text: str) -> str:
+    if not NAME.fullmatch(text):
+        raise ToolError(f"name {text!r}: letters, digits, '.', '_' and '-' only")
+    return text
+
+
+def seconds(text: str) -> int:
+    parts = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text)
+    if not text or not parts:
+        raise ToolError(f"{text!r}: a duration like 90m, 2h or 1h30m")
+    h, m, s = (int(x or 0) for x in parts.groups())
+    return h * 3600 + m * 60 + s
+
+
+def moment(text: str, now: int) -> int:
+    if re.fullmatch(r"\d{4}-\d\d-\d\dT.*Z", text):
+        try:
+            stamp = datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            raise ToolError(f"{text!r}: not a time") from None
+        return int(stamp.timestamp())
+    return now + seconds(text)
+
+
+def clock(epoch) -> str:
+    return wslib.utc(int(epoch)) if str(epoch).isdigit() else "unknown"
+
+
+def lock_words(st: devlib.State) -> str:
+    if not st.locked:
+        return "Free right now."
+    lock = st.lock
+    if not lock.get("owner"):
+        return "Held, owner not written yet."
+    text = f"Held by {lock['owner']}: {lock.get('purpose', '')}. Since {clock(lock.get('since'))}, expects {clock(lock.get('expected_end'))}"
+    end = lock.get("expected_end", "")
+    if end.isdigit() and st.now > int(end):
+        text += f", overdue by {(st.now - int(end)) // 60} min"
+    return text + "."
+
+
+def lock_record(st: devlib.State) -> dict | None:
+    if not st.locked:
+        return None
+    return {k: v for k, v in st.lock.items() if k not in ("made", "running")} | {"held": True}
+
+
+def snapshot(config, st: devlib.State) -> dict:
+    def got(name):
+        code, out = st.probes.get(name, (1, ""))
+        return out if code == 0 and out else None
+
+    free = (got("_free_kb") or "").split()
+    return {"device": config.name, "device_time": st.now, "lock": lock_record(st), "queue": st.queue(config.wait_max_hours),
+            "base": got("base"), "deployment": got("deployment"), "boot_image": got("boot_image"),
+            "renderer": got("renderer"), "overrides": st.overrides, "left": st.left,
+            "free_kb": int(free[3]) if len(free) > 3 and free[3].isdigit() else None,
+            "bases": (got("bases") or "").split() or None}
+
+
+def report(config, device, st: devlib.State | None = None) -> None:
+    """A full snapshot, so a lost one costs nothing. It never fails the command."""
+    if not devlib.hub_socket().exists():
+        return
+    try:
+        if st is None:
+            st = device.read(devlib.REPORT_PROBES)
+        devlib.hub_ask({"op": "device.report", "report": snapshot(config, st)})
+    except Exception as e:  # noqa: BLE001: whatever went wrong, the lock is what matters
+        print(f"dev: no report sent: {e}", file=sys.stderr)
+
+
+def fails(checks) -> list:
+    return [c for c in checks if c.state == "fail"]
+
+
+def note(checks) -> None:
+    for c in checks:
+        if c.state in ("unknown", "unconfirmed"):
+            print(f"dev: {c}", file=sys.stderr)
+
+
+def go_table(actions: list[str], a, config, spend: bool = False) -> None:
+    """The take table, once the action list is known. It raises on a refusal. With spend, a yes uses up a run of the go,
+    so that is asked after everything that can fail and be given back, and nothing the hub can't undo comes before it."""
+    if not actions:
+        return
+    if devlib.hub_holding() is True and set(actions) - WHILE_YOU_HOLD:
+        raise ToolError("the person has the device (\"I've got the device\"): no --does until they press Done")
+    if a.go:
+        answer, words = devlib.hub_says(actions, a.go, config.name, spend)
+        if answer != "yes":
+            raise ToolError(f"go {a.go}: {answer}: {words}")
+
+
+def go_record(a, actions) -> str:
+    if a.go:
+        return word(a.go)
+    return f"said: {word(a.go_said)} (for: {','.join(actions) or 'nothing named'})" if a.go_said else ""
+
+
+def run_cmd(cmd: list[str], after=None) -> int:
+    """CMD on this host. A signal to dev goes on to it, and dev carries on to the release.
+
+    The handlers that forward are in place before CMD starts, and a signal that comes first waits for it, so none lands
+    between the two and escapes as a Stop. When CMD has ended the signals go back to what they were, or to `after`."""
+    child = None
+    early = []
+
+    def forward(signum, _frame):
+        if child is None:
+            early.append(signum)
+        else:
+            child.send_signal(signum)
+
+    old = {s: signal.signal(s, forward) for s in SIGNALS}
+    try:
+        try:
+            child = subprocess.Popen(cmd)
+        except OSError as e:
+            print(f"dev: can't run {cmd[0]}: {e}", file=sys.stderr)
+            return 127
+        for signum in early:
+            child.send_signal(signum)
+        code = child.wait()
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler if after is None else after)
+    return 128 - code if code < 0 else code
+
+
+def give_back(device, token: str) -> None:
+    device.do(f'[ "$(cat lock.d/made 2>/dev/null)" = {shlex.quote(token)} ] && rm -rf lock.d; :')
+
+
+def archive(body: str, what: str, owner: str) -> str:
+    """Shell to rename the lock away, atomically, and keep the newest old records."""
+    return f"""{body}
+mkdir -p history.d
+mv lock.d "history.d/$(date +%s)-{owner}-{what}-$$" || exit 4
+ls history.d | sort -r | tail -n +{devlib.HISTORY_KEPT + 1} | while read -r f; do rm -rf "history.d/$f"; done"""
+
+
+def do_release(config, device, name: str, token: str | None, left=None) -> None:
+    """The same checks, recorded, and it releases anyway: the next take stops on them.
+
+    A left state's hang run is what that state is after, so it takes its own hangchecks with it."""
+    st = device.read(devlib.CHECK_PROBES)
+    if not st.locked:
+        if token is not None:  # an earlier try of this release may have landed with its answer lost, or the lock was broken
+            print("dev: the lock this take made is already gone", file=sys.stderr)
+            return
+        raise ToolError("nobody holds the lock")
+    if st.owner != name:
+        raise ToolError(f"{lock_words(st)} Only the holder releases, and {name} isn't it")
+    if token is None and "running" in st.lock:
+        if devlib.take_has_ended(st.lock["running"]) is not True:
+            raise ToolError(f"{name} holds the lock under a running command, whose take releases it when it ends. "
+                            "If that take is gone and this host can't see it, only dev break clears it, on the person's word")
+        print("dev: the take that held this lock under a command has ended, so this release goes ahead", file=sys.stderr)
+    if token is not None and st.lock.get("made") != token:
+        print(f"dev: the lock was broken or taken over while this ran, so it stays: {lock_words(st)}", file=sys.stderr)
+        return
+    if left and left[0] not in devlib.LEFT_STATES:
+        raise ToolError(f"--left {left[0]}: the states are {', '.join(devlib.LEFT_STATES)}. Anything else needs --dirty from the next session")
+    steps = []
+    if left:
+        record = devlib.fields_text([("owner", name), ("why", left[1]), ("since", st.now)])
+        steps += ["mkdir -p left.d", put(f"left.d/{left[0]}", record), devlib.move_hangcheck_base(st)]
+        st.files[f"left.d/{left[0]}"] = record
+        st.files["hangcheck-base"] = f"{st.boot} {st.probes.get('hangchecks', (1, ''))[1]}"
+    checks = devlib.device_check(config, st)
+    record = devlib.fields_text([("by", name), ("at", st.now)]) + "".join(f"\ncheck: {word(str(c))}" for c in fails(checks))
+    steps += [put("last-release", record), put("lock.d/released", record)]
+    device.do(archive("\n".join(steps), "released", name))
+    for c in fails(checks):
+        print(f"dev: released, but the next take stops on {c}", file=sys.stderr)
+    mine = [k for k, v in st.overrides.items() if v.get("owner") == name and not st.dead_override(v) and v.get("removed") != "next agreed restart"]
+    if mine:
+        print(f"dev: still yours: {', '.join(sorted(mine))}: remove them, or mark them removed: next agreed restart", file=sys.stderr)
+
+
+def release_after_cmd(config, device, name: str, token: str) -> bool:
+    """CMD may have rebooted the device, so an unreachable one gets a while."""
+    tries = max(1, config.release_tries)
+    for attempt in range(tries):
+        try:
+            do_release(config, device, name, token)
+            return True
+        except devlib.Unreachable as e:
+            print(f"dev: {e}", file=sys.stderr)
+        except ToolError as e:
+            print(f"dev: {e}", file=sys.stderr)
+            break
+        if attempt + 1 < tries:
+            time.sleep(config.release_gap_seconds)
+    print(f"dev: the lock may still be held: dev release --as {name}", file=sys.stderr)
+    return False
+
+
+def join(a, cmd, config, device, st) -> int:
+    checks = devlib.device_check(config, st)
+    bad = fails(checks)
+    if bad and not a.dirty:
+        raise ToolError("join refused, the lock stays with you: " + "; ".join(map(str, bad)))
+    note(checks)
+    lock = st.lock
+    if "running" in lock and devlib.take_has_ended(lock["running"]):
+        print(f"dev: the take that holds this lock under a command has ended, and nothing else will release it: "
+              f"dev release --as {a.name}", file=sys.stderr)
+    held = [x for x in lock.get("does", "").split(",") if x]
+    new = [x for x in a.actions if x not in held]
+    # A join that adds actions spends a run, as a take that names them does: else a go for one run would cover every lock
+    # that is taken bare and joined. It's asked before the write, as a join can't give the lock back: a refusal after the
+    # write would leave actions on the lock that no go covers. The cost is a run if that one write then fails.
+    go_table(new, a, config, spend=True)
+    steps = []
+    if new:
+        steps.append(put("lock.d/does", ",".join(held + new)))
+        steps.append(put("lock.d/go", word(" + ".join(filter(None, [lock.get("go"), go_record(a, new)])))))
+    if a.dirty:
+        steps.append(put("lock.d/dirty", word(" + ".join(filter(None, [lock.get("dirty"), a.dirty])))))
+    if steps:
+        device.do(f'[ -d lock.d ] || exit 5\n' + "\n".join(steps))
+    report(config, device)
+    if not cmd:
+        return 0
+    code = run_cmd(cmd)
+    report(config, device)
+    return code
+
+
+def take(a, cmd) -> int:
+    name = name_of(a.name)
+    a.actions = [x for x in map(str.strip, (a.does or "").split(",")) if x]
+    if a.go and a.go_said:
+        raise ToolError("--go or --go-said, not both")
+    if a.actions and not (a.go or a.go_said):
+        raise ToolError(f"--does {','.join(a.actions)}: name a go, with --go ID or --go-said WORDS")
+    if a.keep and not cmd:
+        raise ToolError("--keep is for a take with a command: without one the lock is held until dev release")
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    made = secrets.token_hex(8)
+
+    def stop(signum, _frame):
+        raise Stop(signum)
+
+    for s in SIGNALS:
+        signal.signal(s, stop)
+
+    expect = seconds(a.expect) if a.expect else None
+    # Everything up to the end of CMD is under this try: a Stop can only come before CMD has started (its own handlers
+    # forward from then on), and a signal in the first report gives the lock back like any other refusal.
+    try:
+        fresh = expect is not None and make_lock(a, device, name, made, expect, bool(cmd))
+        if not fresh:
+            st = device.read(devlib.CHECK_PROBES)
+            if st.locked and st.owner == name:
+                return join(a, cmd, config, device, st)
+            if st.locked:
+                raise ToolError(lock_words(st))
+            raise ToolError("the lock was held and has just gone: try again" if expect else "the lock is free: a new take needs --expect")
+        passed(a, config, device, device.read(devlib.CHECK_PROBES), name)
+        report(config, device)
+        if not cmd:
+            return 0
+        code = run_cmd(cmd, after=signal.SIG_IGN)  # it's finishing: let it record and release
+    except Stop as e:
+        give_back_saying(device, made, name)
+        return 128 + e.signum
+    except ToolError:
+        give_back_saying(device, made, name)
+        raise
+    released = True
+    if a.keep:
+        device.do("rm -f lock.d/running")
+    else:
+        released = release_after_cmd(config, device, name, made)
+    report(config, device)
+    return code or (0 if released else 1)
+
+
+def make_lock(a, device, name, made, expect, running) -> bool:
+    """mkdir, and the owner at once. True if this take made it."""
+    fields = [("owner", name), ("made", made), ("purpose", word(a.purpose)), ("does", ",".join(a.actions))]
+    write = "\n".join(put(f"lock.d/{k}", v) for k, v in fields)
+    script = device.prepare() + f"""now=$(date +%s)
+if ! mkdir lock.d 2>/dev/null; then [ -d lock.d ] && exit 10; exit 3; fi
+{write}
+printf '%s\\n' "$now" > lock.d/since
+printf '%s\\n' "$((now + {expect}))" > lock.d/expected_end
+{put("lock.d/running", devlib.take_record(os.getpid())) if running else ":"}
+"""
+    done = device.run(script)
+    if done.returncode not in (0, 10):
+        raise ToolError(f"can't take the lock: exit {done.returncode}: {done.stderr.strip()}")
+    return done.returncode == 0
+
+
+def give_back_saying(device, made, name) -> None:
+    """The token keeps this from touching a lock that isn't this take's."""
+    try:
+        give_back(device, made)
+    except ToolError as problem:
+        print(f"dev: couldn't give the lock back: {problem}: dev release --as {name}", file=sys.stderr)
+
+
+def passed(a, config, device, st, name) -> None:
+    """After mkdir: the queue, the device check, the hub. Raises on a refusal; past those it's a run."""
+    queue = st.queue(config.wait_max_hours)
+    live = [e for e in queue if not e["expired"]]
+    mine = next((e for e in live if e["who"] == name), None)
+    ahead = [e for e in live if e["ready"] and e["who"] != name and (mine is None or (e["time"], e["file"]) < (mine["time"], mine["file"]))]
+    if ahead and not a.ahead:
+        raise ToolError("ready ahead of you: " + ", ".join(e["who"] for e in ahead) + ". Wait, or --ahead WHY")
+
+    # the named state stays until the device leaves it
+    got = st.probes.get("renderer")
+    left_gone = got is not None and not got[0] and got[1] == config.renderer_expected and "cpu-renderer" in st.left
+    if left_gone:
+        st.files.pop("left.d/cpu-renderer")
+
+    checks = devlib.device_check(config, st)
+    bad = fails(checks)
+    if bad and not a.dirty:
+        raise ToolError("the device isn't clean, the lock is given back: " + "; ".join(map(str, bad)) + ". --dirty WHY to run anyway")
+    note(checks)
+
+    # Inside lock.d: a refusal gives the lock back, and these go with it.
+    record = []
+    for key, value in (("go", go_record(a, a.actions)), ("dirty", word(a.dirty)), ("ahead", word(a.ahead))):
+        if value:
+            record.append(put(f"lock.d/{key}", value))
+    record.append(put("lock.d/check", word("; ".join(str(c) for c in checks if c.state != "ok"))))
+    # Outside it: moving the base and clearing entries is not undone by giving the lock back. And it can wait, as a
+    # base that didn't move only stops the next take again, and an entry left behind expires.
+    tidy = [devlib.move_hangcheck_base(st)]
+    if left_gone:
+        tidy.append("rm -f left.d/cpu-renderer")
+    for e in queue:
+        if e["expired"] or e["who"] == name:
+            tidy.append(f"rm -f {shlex.quote('queue.d/' + e['file'])}")
+    for key, override in st.overrides.items():
+        if st.dead_override(override):
+            tidy.append(f"rm -f {shlex.quote('overrides.d/' + key)}")
+
+    if not a.actions:  # nothing to ask the hub: one trip
+        device.do("\n".join(tidy + record))
+        return
+    device.do("\n".join(record))
+    # Last: only a take that has got through everything spends a run, and the hub can't take one back. A device that
+    # fails above costs nothing; one that fails below costs the clean-up, not the take.
+    go_table(a.actions, a, config, spend=True)
+    try:
+        device.do("\n".join(tidy))
+    except ToolError as e:
+        print(f"dev: the take stands, but the clean-up on the device didn't finish (the next take may stop on it): {e}", file=sys.stderr)
+
+
+def release(a) -> int:
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    do_release(config, device, name_of(a.name), None, a.left)
+    report(config, device)
+    return 0
+
+
+def own_entry(st, config, name):
+    return next((e for e in st.queue(config.wait_max_hours) if e["who"] == name and not e["expired"]), None)
+
+
+def wait(a) -> int:
+    name = name_of(a.name)
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    st = device.read()
+    mine = own_entry(st, config, name)
+    if a.drop:
+        if not mine:
+            raise ToolError(f"{name} isn't in the queue")
+        device.do(f"rm -f {shlex.quote('queue.d/' + mine['file'])}")
+    else:
+        if not (a.on and a.until):
+            raise ToolError("dev wait needs --on CONDITIONS and --until TIME, or --drop")
+        until = moment(a.until, st.now)
+        most = st.now + int(config.wait_max_hours * 3600)
+        if not st.now < until <= most:
+            raise ToolError(f"--until {a.until}: within {config.wait_max_hours} h of the device's clock ({clock(st.now)})")
+        entry = devlib.fields_text([("who", name), ("for", a.purpose or ""), ("on", a.on), ("until", until)])
+        # coming back keeps your place, and asks again whether the conditions are met
+        file = mine["file"] if mine else f"{st.now}-{name}"
+        path = "queue.d/" + file
+        done = device.run(device.prepare() + f"{put(path + '.tmp', entry)} && mv {shlex.quote(path + '.tmp')} {shlex.quote(path)}\n")
+        if done.returncode:
+            raise ToolError(f"on the device: exit {done.returncode}: {done.stderr.strip()}")
+    report(config, device)
+    return 0
+
+
+def ready(a) -> int:
+    name = name_of(a.name)
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    st = device.read()
+    mine = own_entry(st, config, name)
+    if not mine:
+        raise ToolError(f"{name} isn't in the queue: dev wait first")
+    device.do(f"printf 'ready: %s\\n' {st.now} >> {shlex.quote('queue.d/' + mine['file'])}")
+    report(config, device)
+    return 0
+
+
+def notice(a) -> int:
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    st = device.read()
+    if not st.locked:
+        raise ToolError("nobody holds the lock, so there's nothing to put a notice on")
+    if a.name and st.owner != a.name:
+        raise ToolError(lock_words(st))
+    device.do(f'{put("lock.d/notice.tmp", word(a.words))} && mv lock.d/notice.tmp lock.d/notice')
+    report(config, device)
+    return 0
+
+
+def do_break(a) -> int:
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    why = word(a.why)
+    if not why:
+        raise ToolError("--why needs the reason, and it's for a dead holder on the person's word")
+    st = device.read()
+    if not st.locked:
+        raise ToolError("nobody holds the lock")
+    owner = st.owner or "nobody"
+    record = devlib.fields_text([("why", why), ("by", a.name or "unnamed"), ("at", st.now)])
+    device.do(archive(put("lock.d/broken", record) + "\n" + put("last-release", f"broken from {owner}\n{record}"), "broken", owner))
+    print(f"broke the lock held by {owner}. The old record is in history.d", file=sys.stderr)
+    report(config, device)
+    return 0
+
+
+def status_lines(config, st) -> list[str]:
+    lines = [lock_words(st)]
+    lock = st.lock
+    for key in ("notice", "does", "go", "ahead", "dirty", "check"):
+        if lock.get(key):
+            lines.append(f"  {key}: {lock[key]}")
+    queue = [e for e in st.queue(config.wait_max_hours) if not e["expired"]]
+    if queue:
+        lines.append("Queue:")
+        for e in queue:
+            state = "ready" if e["ready"] else f"waiting on {e['on']}"
+            lines.append(f"  {e['who']}: {state}, until {clock(e['until'])}" + (f", for {e['for']}" if e["for"] else ""))
+    if st.overrides:
+        lines.append("Overrides:")
+        for key, v in sorted(st.overrides.items()):
+            lines.append(f"  {key}: {v.get('value', '')}, owner {v.get('owner', '?')}, removal: {v.get('remove', 'not recorded')}"
+                         + (" (dead: from another boot)" if st.dead_override(v) else ""))
+    for key, v in sorted(st.left.items()):
+        lines.append(f"Left as {key} by {v.get('owner', '?')}: {v.get('why', '')}")
+    if st.last_release:
+        lines.append("Last release: " + "; ".join(st.last_release.splitlines()))
+    lines.append(f"Device clock {clock(st.now)}. Only mkdir on the device decides.")
+    return lines
+
+
+def status(a) -> int:
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    st = device.read(devlib.REPORT_PROBES)
+    if a.json:
+        print(json.dumps(snapshot(config, st), ensure_ascii=False))
+    else:
+        print("\n".join(status_lines(config, st)))
+    report(config, device, st)
+    return 0
+
+
+def stamp(a) -> int:
+    config = devlib.load_config()
+    device = devlib.Device(config)
+    st = device.read(devlib.STAMP_PROBES)
+
+    def got(name):
+        probe = st.probes.get(name)
+        if probe is None:
+            return "unknown (no probe set)"
+        return probe[1] if probe[0] == 0 and probe[1] else "unknown (probe failed)"
+
+    out = {"device": config.name, "device_time": clock(st.now), "base": got("base"), "boot_image": got("boot_image"),
+           "compositor_sha256": got("compositor_sha256"), "compositor_commit": got("compositor_commit"),
+           "daemon_sha256": got("daemon_sha256"), "daemon_commit": got("daemon_commit"), "renderer": got("renderer"),
+           "fallback_flag": got("_fallback"), "named_states": {k: v.get("why", "") for k, v in st.left.items()},
+           "live_settings": {k: f"{v.get('value', '')} (recorded, unconfirmed)" for k, v in st.overrides.items()
+                             if not v.get("target") and not st.dead_override(v)},
+           "open_apps": got("open_apps"), "gpu_min_clock": got("gpu_min_clock"), "battery_temp": got("battery_temp"),
+           "charging": got("charging"), "dirty": st.lock.get("dirty") or None}
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        for key, value in out.items():
+            print(f"{key}: {value}")
+    return 0
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = []
+    if "--" in argv:
+        at = argv.index("--")
+        argv, cmd = argv[:at], argv[at + 1:]
+    p = argparse.ArgumentParser(prog="dev", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    t = sub.add_parser("take")
+    t.add_argument("--as", dest="name", required=True)
+    t.add_argument("--purpose", required=True)
+    t.add_argument("--expect", help="how long, like 30m. A join doesn't need it")
+    t.add_argument("--does", help="named actions, comma separated: they need a go")
+    t.add_argument("--go")
+    t.add_argument("--go-said")
+    t.add_argument("--dirty", metavar="WHY")
+    t.add_argument("--ahead", metavar="WHY")
+    t.add_argument("--keep", action="store_true")
+    r = sub.add_parser("release")
+    r.add_argument("--as", dest="name", required=True)
+    r.add_argument("--left", nargs=2, metavar=("STATE", "WHY"))
+    w = sub.add_parser("wait")
+    w.add_argument("--as", dest="name", required=True)
+    w.add_argument("--on")
+    w.add_argument("--until")
+    w.add_argument("--for", dest="purpose")
+    w.add_argument("--drop", action="store_true")
+    sub.add_parser("ready").add_argument("--as", dest="name", required=True)
+    n = sub.add_parser("notice")
+    n.add_argument("--as", dest="name")
+    n.add_argument("words")
+    for parser in (sub.add_parser("stamp"), sub.add_parser("status")):
+        parser.add_argument("--json", action="store_true")
+    b = sub.add_parser("break")
+    b.add_argument("--why", required=True)
+    b.add_argument("--as", dest="name")
+    a = p.parse_args(argv)
+    if cmd and a.command != "take":
+        raise ToolError(f"dev {a.command} takes no command")
+    return {"take": lambda x: take(x, cmd), "release": release, "wait": wait, "ready": ready, "notice": notice,
+            "stamp": stamp, "status": status, "break": do_break}[a.command](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(wslib.run("dev", main))

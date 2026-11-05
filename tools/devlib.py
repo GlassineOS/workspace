@@ -31,7 +31,7 @@ DEFAULTS = {
     "ssh": "ssh -o BatchMode=yes -o ConnectTimeout=5 root@172.16.42.1",
     "store": "/root/glassine-dev",  # unverified: must survive a reboot, a deployment switch and a rollback
     "ssh_seconds": 30,
-    "settings": "/etc/na1/eink.conf",
+    "settings": "",  # the settings file the seed is compared with: particular to a device
     "seed": "",  # a file holding the seeded settings; none is shipped yet, so that check says it can't compare
     "renderer_expected": "",
     "fallback_flag": "",

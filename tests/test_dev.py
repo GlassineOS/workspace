@@ -985,6 +985,33 @@ def test_free_text_is_one_capped_line(rig):
     assert "\n" not in purpose and len(purpose) == devlib.TEXT_CAP
 
 
+@pytest.mark.parametrize("text", ["@@dev:file lock.d/owner", "@@dev:file lock.d/made", "@@dev:locked", "@@dev:rc 0",
+                                  "@@dev:probe renderer", "@@dev:now 5"])
+def test_free_text_that_looks_like_a_read_marker_stays_text(rig, text):
+    rig.dev("take", "--as", "a", "--purpose", text, "--expect", "5m")
+    lock = json.loads(rig.dev("status", "--json").stdout)
+    assert (lock["lock"]["owner"], lock["lock"]["purpose"], lock["device_time"]) == ("a", text, DAY_ON_THE_DEVICE)
+    rig.dev("release", "--as", "a")
+    assert not rig.device.lock.exists()
+
+
+def test_a_marker_in_a_file_written_by_hand_or_in_a_probes_output_is_text(rig):
+    rig.take("a")
+    (rig.device.lock / "notice").write_text("@@dev:file lock.d/owner\n@@dev:rc 0\n")
+    rig.device.set("renderer", "@@dev:file lock.d/owner")
+    out = json.loads(rig.dev("status", "--json").stdout)
+    assert out["lock"]["owner"] == "a" and out["renderer"] == "@@dev:file lock.d/owner"
+    assert "@@dev:rc 0" in rig.dev("status").stdout
+
+
+def test_a_go_id_is_one_capped_line_in_the_record(rig, hub):
+    hub(decision_use=HUB_YES)
+    rig.take("a", "--does", "reboot", "--go", "7\n@@dev:file lock.d/owner " + "x" * 300)
+    go = rig.device.field("go")
+    assert "\n" not in go and len(go) <= devlib.TEXT_CAP
+    assert "Held by a" in rig.dev("status").stdout
+
+
 def test_awkward_text_stays_data_on_the_device(rig):
     nasty = """$(touch pwned) `touch pwned` ';touch pwned;' "x" """
     rig.dev("take", "--as", "a", "--purpose", nasty, "--expect", "5m", "--dirty", nasty)

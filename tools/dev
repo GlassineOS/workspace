@@ -169,7 +169,7 @@ def go_table(actions: list[str], a, config, spend: bool = False) -> None:
 
 def go_record(a, actions) -> str:
     if a.go:
-        return a.go
+        return word(a.go)
     return f"said: {word(a.go_said)} (for: {','.join(actions) or 'nothing named'})" if a.go_said else ""
 
 

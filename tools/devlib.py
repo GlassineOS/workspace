@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import socket
 import subprocess
@@ -232,24 +233,28 @@ class Device:
         return None
 
     def read(self, probes=()) -> State:
-        """Everything in the store, and the named probes. Only regular files, so a stray FIFO can't block."""
+        """Everything in the store, and the named probes. Only regular files, so a stray FIFO can't block.
+
+        Every line the script adds to what it reads starts with a mark made for this call, which nothing stored on the
+        device or printed by a probe can know, so free text can't pass for one."""
+        mark = "@@dev-" + secrets.token_hex(8) + ":"
         lines = [
-            "printf '@@dev:now %s\\n' \"$(date +%s)\"",
+            f"printf '{mark}now %s\\n' \"$(date +%s)\"",
             f"if cd {self.quoted} 2>/dev/null; then",
-            "  [ -d lock.d ] && echo @@dev:locked",
+            f"  [ -d lock.d ] && echo {mark}locked",
             "  for f in lock.d/* queue.d/* overrides.d/* left.d/* hangcheck-base last-release; do",
-            "    if [ -f \"$f\" ]; then printf '@@dev:file %s\\n' \"$f\"; cat \"$f\"; echo; fi",
+            f"    if [ -f \"$f\" ]; then printf '{mark}file %s\\n' \"$f\"; cat \"$f\"; echo; fi",
             "  done",
             "fi",
         ]
         for name in ("boot_id", *probes):
             command = self.probe_command(name)
             if command is not None:
-                lines += [f"echo '@@dev:probe {name}'", f"( {command}\n) 2>/dev/null </dev/null", "printf '\\n@@dev:rc %s\\n' \"$?\""]
+                lines += [f"echo '{mark}probe {name}'", f"( {command}\n) 2>/dev/null </dev/null", f"printf '\\n{mark}rc %s\\n' \"$?\""]
         done = self.run("\n".join(lines) + "\n")
         if done.returncode:
             raise wslib.ToolError(f"reading the device: exit {done.returncode}: {done.stderr.strip()}")
-        return parse_read(done.stdout)
+        return parse_read(done.stdout, mark)
 
 
 class Unreachable(wslib.ToolError):
@@ -299,7 +304,7 @@ def take_has_ended(record: str) -> bool | None:
     return bool(fields.get("start")) and fields["start"] != found[1]  # a different start time: the pid is someone else's now
 
 
-def parse_read(text: str) -> State:
+def parse_read(text: str, mark: str = "@@dev:") -> State:
     state = State()
     kind, name, body = None, None, []
 
@@ -308,8 +313,8 @@ def parse_read(text: str) -> State:
             state.files[name] = "\n".join(body).rstrip("\n")
 
     for line in text.splitlines():
-        if line.startswith("@@dev:"):
-            tag, _, rest = line[6:].partition(" ")
+        if line.startswith(mark):
+            tag, _, rest = line[len(mark):].partition(" ")
             if tag == "now":
                 state.now = int(rest) if rest.isdigit() else 0
             elif tag == "locked":

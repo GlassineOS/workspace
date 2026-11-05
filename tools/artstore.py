@@ -296,12 +296,21 @@ def _needles(entry: dict) -> re.Pattern:
     return re.compile("|".join(parts).encode())
 
 
-def _mounts() -> set[str]:
-    """Other file systems inside a place (a mounted image, a chroot's /proc) aren't that place's files."""
+_ESCAPED = re.compile(rb"\\([0-3][0-7]{2})")
+
+
+def _mounts(table: str = "/proc/self/mountinfo") -> set[str]:
+    """Other file systems inside a place (a mounted image, a chroot's /proc) aren't that place's files.
+
+    mountinfo writes a space, tab, newline and backslash in a mount point as \\040, \\011, \\012 and \\134, so
+    they're turned back, or a mount point with a space in it would be walked as if it were the place's own.
+    """
     try:
-        return {line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()}
+        rows = Path(table).read_bytes().split(b"\n")
     except OSError:
         return set()
+    return {os.fsdecode(_ESCAPED.sub(lambda m: bytes([int(m.group(1), 8)]), row.split()[4])) for row in rows
+            if len(row.split()) > 4}
 
 
 def _names_it(path: Path, needles: re.Pattern, overlap: int) -> bool | None:
@@ -345,11 +354,12 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
     hits = _artifact_hits(entry, folder, needles)
     target = location(entry).resolve()
     roots = places()
-    pruned = set(roots) | {Path(m) for m in _mounts()}  # a root is walked as its own; nothing else is left out
+    mounted = {Path(m) for m in _mounts()} - set(roots)
+    pruned = set(roots) | mounted  # a root is walked as its own; nothing else is left out
     overlap = len(needles.pattern)
     store = artifacts().resolve()
     stats = {"places": [str(r) for r in roots], "files": 0, "binary": 0, "unreadable": 0, "unreadable_paths": [],
-             "binary_paths": [], "unlistable": []}
+             "binary_paths": [], "unlistable": [], "mounts": []}
 
     def unlistable(error: OSError) -> None:
         stats["unlistable"].append(f"{error.filename}: {error.strerror}")
@@ -357,6 +367,7 @@ def search(entry: dict, folder: str, limit: int = 50) -> tuple[list[str], dict]:
     for root in roots:
         for directory, subdirs, files in os.walk(root, onerror=unlistable):
             at = Path(directory)
+            stats["mounts"] += [str(at / d) for d in subdirs if at / d in mounted and len(stats["mounts"]) < _LISTED]
             subdirs[:] = [d for d in subdirs if d not in _NEVER_READ and at / d not in pruned]
             for name in files:
                 path = at / name
@@ -397,6 +408,8 @@ def coverage(stats: dict) -> str:
     """What a search read, in words, so a clear result isn't taken for more than it was."""
     words = (f"searched {stats['files']} files in {len(stats['places'])} places: {stats['binary']} of them binary, "
              f"not read for references, and {stats['unreadable']} more unreadable")
+    if stats.get("mounts"):
+        words += f"; {len(stats['mounts'])} other file systems mounted inside the places weren't read"
     return words + (f"; stopped at {stats['stopped_at']} hits" if "stopped_at" in stats else "")
 
 

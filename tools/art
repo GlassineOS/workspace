@@ -72,6 +72,8 @@ def rm(a) -> int:
     print(artstore.coverage(stats))
     for path in stats["unreadable_paths"]:
         print(f"  not read: {path}")
+    for path in stats.get("mounts", []):
+        print(f"  not read, another file system: {path}")
     for path in stats["binary_paths"]:
         print(f"  skipped as binary: {path}")
     skipped = stats["binary"] - len(stats["binary_paths"])

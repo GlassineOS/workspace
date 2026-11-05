@@ -724,3 +724,30 @@ def test_the_files_skipped_as_binary_are_named_in_the_output_and_the_tombstone(w
     assert f"skipped as binary: {utf16}" in out and f"skipped as binary: {logged}" in out
     ws.art("rm", "a.bin", "--why", "x")
     assert sorted(entries(ws)[0]["tombstone"]["search"]["binary_paths"]) == sorted([str(utf16), str(logged)])
+
+
+def test_mountinfo_is_unescaped_so_a_mount_point_with_a_space_is_known(tmp_path):
+    table = tmp_path / "mountinfo"
+    table.write_bytes(b"36 35 98:0 / /mnt/my\\040disk rw - ext4 /dev/x rw\n"
+                      b"37 35 98:1 / /mnt/tab\\011and\\134slash rw,noatime shared:1 - ext4 /dev/y rw\n"
+                      b"38 35 98:2 / /mnt/\xc3\xa4 rw - ext4 /dev/z rw\n"
+                      b"39 35 98:3 / /plain rw - tmpfs t rw\n"
+                      b"short\n\n")
+    assert artstore._mounts(str(table)) == {"/mnt/my disk", "/mnt/tab\tand\\slash", "/mnt/ä", "/plain"}
+    assert artstore._mounts(str(tmp_path / "missing")) == set()
+
+
+def test_a_mounted_folder_inside_a_place_is_skipped_and_counted(ws, monkeypatch):
+    """The skipping is run against a made-up mount list: mounting needs root, so no real mount is covered here."""
+    ws.add("a.bin")
+    mounted = ws.old_tree / "my disk"
+    mounted.mkdir()
+    (mounted / "ref.txt").write_text("a.bin\n")
+    (ws.old_tree / "plain.txt").write_text("nothing\n")
+    monkeypatch.setattr(artstore, "_mounts", lambda: {str(mounted.resolve())})
+    folder, entry = artstore.resolve("a.bin")
+    hits, stats = artstore.search(entry, folder)
+    assert hits == [] and stats["mounts"] == [str(mounted.resolve())]
+    assert "1 other file systems" in artstore.coverage(stats)
+    monkeypatch.setenv("GLASSINE_ART_PLACES", str(mounted))  # a mount that is a place itself is read
+    assert artstore.search(entry, folder)[0] == [str(mounted.resolve() / "ref.txt")]

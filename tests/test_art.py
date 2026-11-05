@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
+import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -443,7 +445,7 @@ def test_a_move_that_cant_remove_its_source_stores_nothing(ws):
         other.chmod(0o500)  # the original can be copied but not removed
         err = ws.art("add", src, "--to", "bases", "--class", "ours", "--what", "x", "--keep", "user", code=1).stderr
         assert "can't be removed" in err
-        assert src.exists() and not (ws.artifacts / "bases" / "manifest.jsonl").exists()
+        assert src.exists() and entries(ws) == []
         assert ws.art("verify").stdout == ""  # no store copy left behind
     finally:
         other.chmod(0o700)
@@ -552,3 +554,72 @@ def test_a_name_that_changed_content_while_rm_searched_is_not_removed(ws, monkey
         artstore.remove("a.bin", why="second", by="me")
     assert entries(ws)[1]["tombstone"] is None and not path.exists()
     assert Path(ws.art("path", "a.bin").stdout.strip()).read_text() == "two\n"
+
+
+def leftovers(ws):
+    return sorted(str(p.relative_to(ws.artifacts)) for p in ws.artifacts.rglob("*.new"))
+
+
+def test_a_what_that_isnt_utf8_is_refused_before_anything_moves(ws):
+    src = ws.file("a.bin")
+    done = subprocess.run([sys.executable, str(Path(artstore.__file__).parent / "art"), "add", str(src), "--to", "bases",
+                           "--class", "ours", "--keep", "user", "--what", b"caf\xe9"], capture_output=True)
+    assert done.returncode == 1 and b"UTF-8" in done.stderr and b"Traceback" not in done.stderr
+    assert src.exists() and leftovers(ws) == []
+    assert not [p for p in (ws.artifacts / "bases").iterdir() if p.name != "manifest.jsonl"]
+    ws.art("verify")
+
+
+def test_a_full_disk_while_writing_the_entry_moves_nothing(ws, monkeypatch):
+    src = ws.file("a.bin")
+
+    def full(_):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(OSError, match="No space"):
+        artstore.add(src, "bases", name=None, cls="ours", what="x", keep="user", by="me")
+    assert src.exists() and leftovers(ws) == [] and artstore.read("bases") == []
+    assert not [p for p in (ws.artifacts / "bases").iterdir()]
+
+
+def test_a_failed_move_takes_the_entry_out_again_and_leaves_the_source(ws, monkeypatch):
+    ws.add("kept.bin")
+    before = (ws.artifacts / "bases" / "manifest.jsonl").read_text()
+    src = ws.file("a.bin")
+
+    def full(*_):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(artstore, "_store", full)
+    with pytest.raises(OSError, match="No space"):
+        artstore.add(src, "bases", name=None, cls="ours", what="x", keep="user", by="me")
+    assert src.exists() and (ws.artifacts / "bases" / "manifest.jsonl").read_text() == before
+
+
+def test_a_copy_that_runs_out_of_room_leaves_no_partial_file_in_the_store(ws, monkeypatch):
+    other = elsewhere_device(ws)
+    try:
+        src = other / "big.bin"
+        src.write_text("data\n")
+
+        def partial(source, target):
+            Path(target).write_text("da")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(artstore.shutil, "copyfile", partial)
+        with pytest.raises(OSError):
+            artstore.add(src, "bases", name=None, cls="ours", what="x", keep="user", by="me")
+        assert src.exists() and leftovers(ws) == [] and artstore.read("bases") == []
+        assert not [p for p in (ws.artifacts / "bases").iterdir() if p.name != "manifest.jsonl"]
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+def test_a_why_that_isnt_utf8_deletes_nothing(ws):
+    ws.add("a.bin")
+    path = Path(ws.art("path", "a.bin").stdout.strip())
+    done = subprocess.run([sys.executable, str(Path(artstore.__file__).parent / "art"), "rm", "a.bin", "--why", b"caf\xe9"],
+                          capture_output=True)
+    assert done.returncode == 1 and b"UTF-8" in done.stderr
+    assert path.exists() and entries(ws)[0]["tombstone"] is None and leftovers(ws) == []

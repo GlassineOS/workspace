@@ -54,7 +54,7 @@ def read(folder: str) -> list[dict]:
         return []
     entries = []
     # Split on "\n" only: splitlines() also splits on U+2028, U+2029 and U+0085, which _write leaves raw.
-    for number, line in enumerate(path.read_text().split("\n"), 1):
+    for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
         if not line:
             continue
         try:
@@ -67,13 +67,21 @@ def read(folder: str) -> list[dict]:
 def _write(folder: str, entries: list[dict]) -> None:
     path = _manifest(folder)
     temporary = path.with_name(path.name + ".new")
-    with open(temporary, "w") as f:
-        for entry in entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
+    try:  # encode everything before touching a file: a lone surrogate (non-UTF-8 argument) fails here
+        data = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries).encode("utf-8")
+    except UnicodeEncodeError:
+        raise ToolError("a value isn't valid UTF-8 text (an argument in another encoding?), so it can't go in "
+                        "the manifest; nothing was changed") from None
+    try:
+        with open(temporary, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)  # no half-written manifest.jsonl.new left behind (a full disk, say)
+        raise
 
 
 def _lock():
@@ -128,8 +136,13 @@ def _store(source: Path, into: Path, sha256: str, copy: bool) -> None:
         os.rename(source, into)
     else:
         temporary = into.with_name(into.name + ".new")
-        shutil.copyfile(source, temporary)
-        if digest(temporary) != sha256:
+        try:
+            shutil.copyfile(source, temporary)
+            same = digest(temporary) == sha256
+        except BaseException:
+            temporary.unlink(missing_ok=True)  # a partial copy (a full disk) isn't left in the store
+            raise
+        if not same:
             temporary.unlink()
             raise ToolError(f"copying {source} gave different content, nothing was stored")
         os.rename(temporary, into)
@@ -182,9 +195,20 @@ def add(source: Path, folder: str, *, name: str | None, cls: str, what: str, kee
                 if other["sha256"] == sha256:
                     return other, False
                 raise ToolError(f"the name {name} is taken by different content ({other['id']})")
+        # The entry first, then the file: a failed write moves nothing, and a failed move takes the entry out again.
+        # A crash between the two leaves an entry whose file is missing, which `art verify` reports as an error.
+        before = read(folder)
+        _write(folder, before + [entry])
         if not in_place:
-            _store(source, artifacts() / entry["path"], sha256, copy)
-        _write(folder, read(folder) + [entry])
+            try:
+                _store(source, artifacts() / entry["path"], sha256, copy)
+            except BaseException as failure:
+                try:
+                    _write(folder, before)
+                except Exception as e:
+                    raise ToolError(f"{name} couldn't be stored ({failure}) and its entry couldn't be taken out again ({e}): "
+                                    "`art verify` shows it as missing") from None
+                raise
     return entry, True
 
 

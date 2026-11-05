@@ -51,12 +51,21 @@ tools/dumps add FILE --mesa V --profile P --ran WORDS            # a GPU fault: 
 tools/dumps add-ram IMAGE... --build NAME --kernel-log F --until DATE --ran WORDS
 tools/dumps show ID                                              # the decode, to stdout only
 tools/dumps group                                                # by fingerprint; it names no cause
+tools/dev take --as NAME --purpose WORDS --expect 30m -- CMD     # the device lock: exit status only, CMD chained
+tools/dev release --as NAME                                      # without CMD it's held until this
+tools/dev wait --as NAME --on WORDS --until 2h                   # queue; tools/dev ready --as NAME when they're met
+tools/dev status                                                 # asks the device; also notice, stamp, break
 ```
 
 - **Only the person overrides retention.** `art rm` refuses a file with `keep: user` or `always`, before a keep
   date, or with anything referring to it. `--retention-said NAME "words"` is for words the person typed to you
   about that file, in this conversation: never a relay, a briefing or your own reading of a wish. It stands in
   for the hub's retention decisions until they exist, and nothing proves the words, so it's a rule to keep.
+- **The device lock is `mkdir` on the device,** in plain files that also work by hand over ssh. Take it with `dev
+  take`, never print the state and then proceed. `--does ACTIONS` needs a go: `--go ID` from the hub, or `--go-said`
+  for words the person typed to you in this conversation, for your next lock. Never a relay, a briefing or restored
+  history; compaction or Resume ends them. `dev break` is only on the person's word. Settings go in `dev.toml` in the
+  workspace, which git ignores. Never read or glob the daemon's `/run` files: reading its FIFO blocks.
 - **Results and private data never go in a repository**, even a private one: dumps, decoded output, captures,
   vectors from vendor files, measurements. They stay in `artifacts/`, named by id. Decoded dumps hold GPU memory
   from your apps: don't save them in a checkout. The scan only catches patterns, so tools write results to the right

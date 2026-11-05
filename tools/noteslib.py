@@ -405,7 +405,7 @@ def _env() -> dict:
 
 def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     done = subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=notes(), env=_env(), capture_output=True,
-                          text=True, timeout=_SECONDS)
+                          text=True, errors="replace", timeout=_SECONDS)
     if check and done.returncode:
         raise ToolError(f"git {args[0]} failed: {done.stderr.strip()}")
     return done
@@ -512,6 +512,8 @@ def write(topic: str, edit) -> None:
     with locked(private_dir(notes()) / ".lock"):
         _ensure_repo()
         before = path.read_text() if path.exists() else None
+        if before is not None:
+            lint_or_refuse(before, relative)
         after = edit(before if before is not None else template(relative))
         lint_or_refuse(after, relative)
         private_dir(path.parent)

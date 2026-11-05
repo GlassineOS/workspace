@@ -250,6 +250,14 @@ def test_a_hand_broken_topic_blocks_the_next_write_in_words(nb):
     assert nb.file.read_text() == page("- c1 [guess] x\n")
 
 
+def test_a_topic_missing_its_sections_refuses_in_words(nb):
+    nb.add("words")
+    nb.file.write_text("# a/t\n")
+    for done in (nb.set("A fact", "--user", code=1), nb.add("Why?", "--guess", "--open", code=1)):
+        assert "is missing" in done.stderr and "Traceback" not in done.stderr
+    assert nb.file.read_text() == "# a/t\n"
+
+
 def test_lint_and_find_create_nothing(nb):
     assert "0 topics" in nb.run("lint").stderr
     assert nb.find("anything") == []
@@ -442,6 +450,14 @@ def test_the_hook_finds_a_real_address_behind_an_allowed_one(nb):
     nb.add("start")
     said = nb.hand_commit(page(log=f"### {TODAY}\n- {ZERO_ADDRESS}\n- {ADDRESS}\n"), code=1)
     assert "an address at line" in said
+
+
+def test_the_hook_refuses_a_hand_staged_binary_in_words(nb):
+    nb.add("start")
+    (nb.root / "a" / "dump.bin").write_bytes(b"\xff\xfe\x00\xff")
+    nb.git("add", "a/dump.bin")
+    done = subprocess.run(["git", "commit", "-q", "-m", "x"], cwd=nb.root, capture_output=True, text=True)
+    assert done.returncode == 1 and "dump.bin" in done.stderr and "Traceback" not in done.stderr
 
 
 def test_the_hook_lints_hand_edits_and_lets_clean_ones_through(nb):

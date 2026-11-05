@@ -492,7 +492,13 @@ def verify(refs: list[str]) -> tuple[list[str], list[str]]:
         path = location(entry)
         if not path.is_file():
             problems.append(f"missing  {entry['name']}: {path}")
-        elif digest(path) != entry["sha256"]:
+            continue
+        try:
+            changed = digest(path) != entry["sha256"]
+        except OSError as e:  # one file nobody can read doesn't hide what's wrong with the rest
+            problems.append(f"unreadable  {entry['name']}: {path}: {e.strerror}")
+            continue
+        if changed:
             problems.append(f"changed  {entry['name']}: {path}")
     unindexed = []
     if not refs:

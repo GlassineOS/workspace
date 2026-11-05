@@ -696,3 +696,18 @@ def test_a_manifest_that_isnt_utf8_or_a_broken_workspace_toml_stops_in_words(ws,
     config.write_text("[art\nsearch = 1\n")
     err = ws.art("rm", "a.bin", "--why", "x", code=1).stderr
     assert str(config) in err and "line 1" in err and "Traceback" not in err
+
+
+@needs_permissions
+def test_verify_reports_a_file_it_cant_read_and_carries_on(ws):
+    for name in ("one.bin", "two.bin", "three.bin"):
+        (ws.old_tree / name).write_text(name)
+        ws.art("add", ws.old_tree / name, "--in-place", "--to", "vendor", "--class", "vendor", "--what", "x", "--keep", "user")
+    (ws.old_tree / "one.bin").chmod(0o000)
+    (ws.old_tree / "three.bin").write_text("changed")
+    try:
+        done = ws.art("verify", code=1)
+    finally:
+        (ws.old_tree / "one.bin").chmod(0o600)
+    assert "unreadable  one.bin" in done.stdout and "changed  three.bin" in done.stdout and "Traceback" not in done.stderr
+    assert "two.bin" not in done.stdout

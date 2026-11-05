@@ -313,8 +313,8 @@ def remove(ref: str, *, why: str, by: str, retention: tuple[str, str] | None = N
            dry_run: bool = False) -> dict:
     """Remove an artifact if nothing holds it, leaving a tombstone. Raises with the reasons if something does.
 
-    retention is (file named, the person's words): the stand-in for a recorded retention decision, until the
-    hub has them. Nothing proves the words. It lifts keep, references and changed content, not a failed search.
+    retention is (file named, the person's words). The hub doesn't record retention decisions, and docs/workspace.md
+    in the hub says why. Nothing proves the words. It lifts keep, references and changed content, not a failed search.
     """
     if not why.strip():
         raise ToolError("say why: why can't be empty")

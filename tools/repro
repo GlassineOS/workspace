@@ -37,6 +37,11 @@ and the source's and binary's hashes, and stores the result in artifacts/repro w
 The output goes to a log there, not to the terminal. It warns on a base other than --base, on a binary other
 than earlier results on that base had, and on anything bound over a live binary.
 
+The timeout is a bound on this host. With where = "device" it ends the local ssh, and nothing here stops the script on
+the device: without a pty ssh doesn't signal the remote command when the client dies, so after a timeout or a signal
+the script may still run on the device while the lock goes back. The result says so in its warnings, and so does the
+terminal. Don't rely on the timeout to stop something that can hurt the device; write the script to bound itself.
+
 Exit: 0 pass, 77 skipped (no private input here: no lock, no result), 1 for everything else. 1 is not only "the
 reproducer failed": it is also a lock that was refused (held, or a --does without a go), a repro.toml that isn't
 sound, a missing --as or --base, and a release that failed after a pass (the result is stored, and dev says so). The
@@ -166,6 +171,12 @@ def inside(a) -> int:
             argv = kitlib.fill_command(r["run"]["command"], source, r["folder"])
             ran = kitlib.run_bounded(argv, log, seconds=seconds, env=kitlib.host_env(r["device"]), cwd=r["folder"])
         log.touch()
+        if r["run"]["where"] == "device" and (ran.timed_out or ran.stopped):
+            cut = "timed out" if ran.timed_out else "stopped"
+            note = (f"{cut}: that ended the local ssh, not the script on the device, which may still be running while the lock "
+                    "goes back. Look at the device before anything else takes it")
+            notes.append(note)
+            print(f"repro: warning: {note}", file=sys.stderr)
         output = log.read_text(errors="replace")
         result, why = ("stopped", "stopped from outside") if ran.stopped else judge(r, ran, output)
         log_id = kitlib.store_log(log, "repro", name, f"output of reproducer {r['name']} on {base}", a.by)

@@ -211,7 +211,19 @@ def test_a_timeout_is_a_fail_and_the_lock_goes_back(kit):
         """, s_sh="sleep 60\n")
     done = kit.repro("run", "slow", "--as", "a", code=1)
     assert "timed out" in done.stdout and not kit.device.lock.exists()
+    assert "may still be running" not in done.stderr  # a host command is the process group this tool killed
     assert kit.results()[0]["repro"]["result"] == "fail"
+
+
+def test_a_device_timeout_warns_that_the_script_on_the_device_may_still_run(kit):
+    kit.simple("slow-device", script="sleep 60\n", more="")
+    toml = kit.kit / "repro" / "slow-device" / "repro.toml"
+    toml.write_text(toml.read_text().replace('timeout = "1m"', 'timeout = "1s"'))
+    done = kit.repro("run", "slow-device", "--as", "a", code=1)
+    assert "may still be running" in done.stderr
+    record = kit.record(kit.results()[0])
+    assert record["result"] == "fail" and any("may still be running" in w for w in record["warnings"])
+    assert "may still be running" in kit.repro("gate", "base-7", code=1).stdout
 
 
 def test_a_signal_is_stored_as_stopped_and_the_lock_goes_back(kit):

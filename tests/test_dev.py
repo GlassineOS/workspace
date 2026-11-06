@@ -263,7 +263,7 @@ def test_a_signal_as_cmd_starts_waits_for_it_and_goes_on_to_it(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", popen)
     try:
         started = time.time()
-        assert dev.run_cmd(["sleep", "30"], after=signal.SIG_IGN) == 128 + signal.SIGTERM
+        assert devlib.run_cmd(["sleep", "30"], after=signal.SIG_IGN) == 128 + signal.SIGTERM
         assert time.time() - started < 10
         assert all(signal.getsignal(s) == signal.SIG_IGN for s in signals)  # CMD is over: no handler can land before the release
     finally:

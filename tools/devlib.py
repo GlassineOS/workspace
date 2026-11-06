@@ -14,8 +14,10 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import socket
 import subprocess
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -445,6 +447,39 @@ def move_hangcheck_base(st: State) -> str:
     if got is None or got[0] or not got[1].isdigit():
         return ":"
     return put("hangcheck-base", f"{st.boot} {got[1]}")
+
+
+SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def run_cmd(cmd: list[str], after=None) -> int:
+    """CMD on this host. A signal to dev goes on to it, and dev carries on to the release.
+
+    The handlers that forward are in place before CMD starts, and a signal that comes first waits for it, so none lands
+    between the two and escapes as a Stop. When CMD has ended the signals go back to what they were, or to `after`."""
+    child = None
+    early = []
+
+    def forward(signum, _frame):
+        if child is None:
+            early.append(signum)
+        else:
+            child.send_signal(signum)
+
+    old = {s: signal.signal(s, forward) for s in SIGNALS}
+    try:
+        try:
+            child = subprocess.Popen(cmd)
+        except OSError as e:
+            print(f"dev: can't run {cmd[0]}: {e}", file=sys.stderr)
+            return 127
+        for signum in early:
+            child.send_signal(signum)
+        code = child.wait()
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler if after is None else after)
+    return 128 - code if code < 0 else code
 
 
 # --- the hub: one JSON line in, one out, hubd's socket on this host. Never needed for the device.

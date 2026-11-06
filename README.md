@@ -3,7 +3,7 @@
 The layout agents and people work in: main checkouts of the organization's repositories next
 to each other, and `work/<task>/<repo>` worktrees for anything being changed. `ws` manages
 them, `workspace.toml` lists the repositories, `tools/` holds the tools for artifacts, dumps, notes, the device,
-reproducers and benchmarks, and `CLAUDE.md` holds the rules.
+reproducers, benchmarks and trying a build, and `CLAUDE.md` holds the rules.
 
 `repro/` and `bench/` hold reproducers and benchmarks as code, one folder each with its `repro.toml` or `bench.toml`.
 They're tracked here, and their results never are: `tools/repro` and `tools/bench` store them in `artifacts/`, which

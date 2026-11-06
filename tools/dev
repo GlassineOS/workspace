@@ -49,7 +49,6 @@ import re
 import secrets
 import shlex
 import signal
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -63,7 +62,7 @@ from devlib import put, word  # noqa: E402
 from wslib import ToolError  # noqa: E402
 
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+SIGNALS = devlib.SIGNALS
 # You can hold the device while a session holds the lock for an eye test: "I've got the device" doesn't refuse it.
 WHILE_YOU_HOLD = {"eye-test"}
 
@@ -176,36 +175,6 @@ def go_record(a, actions) -> str:
     return f"said: {word(a.go_said)} (for: {','.join(actions) or 'nothing named'})" if a.go_said else ""
 
 
-def run_cmd(cmd: list[str], after=None) -> int:
-    """CMD on this host. A signal to dev goes on to it, and dev carries on to the release.
-
-    The handlers that forward are in place before CMD starts, and a signal that comes first waits for it, so none lands
-    between the two and escapes as a Stop. When CMD has ended the signals go back to what they were, or to `after`."""
-    child = None
-    early = []
-
-    def forward(signum, _frame):
-        if child is None:
-            early.append(signum)
-        else:
-            child.send_signal(signum)
-
-    old = {s: signal.signal(s, forward) for s in SIGNALS}
-    try:
-        try:
-            child = subprocess.Popen(cmd)
-        except OSError as e:
-            print(f"dev: can't run {cmd[0]}: {e}", file=sys.stderr)
-            return 127
-        for signum in early:
-            child.send_signal(signum)
-        code = child.wait()
-    finally:
-        for s, handler in old.items():
-            signal.signal(s, handler if after is None else after)
-    return 128 - code if code < 0 else code
-
-
 def give_back(device, token: str) -> None:
     device.do(f'[ "$(cat lock.d/made 2>/dev/null)" = {shlex.quote(token)} ] && rm -rf lock.d; :')
 
@@ -302,7 +271,7 @@ def join(a, cmd, config, device, st) -> int:
     report(config, device)
     if not cmd:
         return 0
-    code = run_cmd(cmd)
+    code = devlib.run_cmd(cmd)
     report(config, device)
     return code
 
@@ -342,7 +311,7 @@ def take(a, cmd) -> int:
         report(config, device)
         if not cmd:
             return 0
-        code = run_cmd(cmd, after=signal.SIG_IGN)  # it's finishing: let it record and release
+        code = devlib.run_cmd(cmd, after=signal.SIG_IGN)  # it's finishing: let it record and release
     except Stop as e:
         give_back_saying(device, made, name)
         return 128 + e.signum

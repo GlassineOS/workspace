@@ -10,7 +10,7 @@ repository's own `CLAUDE.md` loads when you read its files, and applies inside i
 | `<repo>/` | main checkout (`.github` lives in `github/`) | Stays on its default branch and clean. Read it, don't work in it. |
 | `work/<task>/<repo>/` | your worktrees | All edits, builds and commits happen here. |
 | `tools/` | the workspace's own tools, beside `ws` | Run them from any checkout. |
-| `repro/`, `bench/` | reproducers and benchmarks, each a folder with a `repro.toml` or `bench.toml` | Code only: results go to `artifacts/`. |
+| `repro/`, `bench/`, `loop/` | reproducers, benchmarks and per-binary recipes, each a folder with its `.toml` | Code only: results go to `artifacts/`. |
 | `artifacts/` | dumps, bases, images, captures, bench, repro results, vendor files, each with a `manifest.jsonl` | Ignored, on this host only. Goes through `art`. |
 | `notes/` | what's known, per topic: `notes/<area>/<topic>.md`, its own local git with no remote | Ignored, on this host only. Goes through `notes`, or by hand with its pre-commit hook. |
 | `~/.cache/glassine/` | build output, kernel objects, downloads: what can be rebuilt | Anything may delete it. Nothing may point into it. |
@@ -66,6 +66,8 @@ tools/repro run NAME --as NAME                                   # under the loc
 tools/repro gate BASE --patches DIR                              # what's missing or failed; runs nothing
 tools/bench run NAME --as NAME                                   # interleaved arms, result in artifacts/bench
 tools/bench eye --binary X --setting K=V --content W --said W    # an eye test is a result too
+tools/loop run NAME --as NAME -- CMD                             # build, bind, record, test, restore, under your take
+tools/loop up NAME --as NAME; tools/loop restore NAME --as NAME  # the same in two steps, staying bound between
 ```
 
 - **Only the person overrides retention.** `art rm` refuses a file with `keep: user` or `always`, before a keep
@@ -81,6 +83,12 @@ tools/bench eye --binary X --setting K=V --content W --said W    # an eye test i
   vectors from vendor files, measurements. They stay in `artifacts/`, named by id. Decoded dumps hold GPU memory
   from your apps: don't save them in a checkout. The scan only catches patterns, so tools write results to the right
   place themselves. Our own measured numbers may stay in a comment or commit message where they justify a default.
+- **Don't bind by hand, use `loop`:** the hazards are in the tool. It stops a process before unmounting and never unmounts
+  lazily, reapplies live values from `overrides.d`, keeps the config file's inode and mode, and a restart of the compositor
+  closes every app window, so it needs a go. Reboot is the rollback. It joins your take and never releases it. What it
+  generates holds those; the checks on a recipe's own commands (no kill of a daemon, no `sed -i`, not the config file) are
+  text matches that don't look inside a script a recipe calls, so read what a `stop` or `start` runs. Recipes aren't tried
+  on a device until someone with a go has run them.
 - **Notes say where each claim comes from:** `seen` (a base and a command or artifact), `inferred` (from which
   claims), `guess`, `user` or `archive`. Current takes only `seen`, `user` and `inferred` resting on Current, so a
   guess can't rise by being repeated. Nothing is deleted: what's replaced or retracted goes to Log, marked. `add` and

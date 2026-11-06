@@ -327,9 +327,9 @@ def up_script(recipes: list[Recipe], store: str, boot_probe: str, binds: str, ow
     for r in recipes:
         out += [f"if {is_bound(r, binds)}; then {fail(f'{r.target} is already bound: restore it first', 20)}; fi",
                 f"loop_pid=$(pidof -s {quote(r.environment_from)}) || {fail(f'{r.environment_from} is not running, so there is no session environment to start {r.binary} with', 20)}",
-                f'cat "/proc/$loop_pid/environ" > {quote(r.folder + "/session.environ")} || {fail("cannot read the session environment", 20)}']
+                f'( umask 077; cat "/proc/$loop_pid/environ" > {quote(r.folder + "/session.environ")} ) || {fail("cannot read the session environment", 20)}']
         if r.settings:
-            out.append(f"cat {quote(r.config)} > {quote(r.folder + '/config.orig')} || {fail(f'cannot read {r.config}', 20)}")
+            out.append(f"( umask 077; cat {quote(r.config)} > {quote(r.folder + '/config.orig')} ) || {fail(f'cannot read {r.config}', 20)}")
     for r in recipes:
         if not r.reexec:
             out.append(stop_block(r))

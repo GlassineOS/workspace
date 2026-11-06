@@ -1003,3 +1003,23 @@ def test_restored_means_the_process_is_running(lp):
     done = lp.loop("restore", "widgetd", "--as", "a", code=1)
     assert "widgetd isn't running" in done.stderr and "restored" not in done.stdout
     assert lp.log() == []  # a rolled-back bind still restarts nothing
+
+
+def test_the_override_folder_and_the_saved_environment_are_private(lp):
+    lp.recipe(more=conf(lp))
+    lp.take("a")
+    old = os.umask(0o022)
+    try:
+        lp.loop("up", "widgetd", "--as", "a", "--config", "widgetd:@a=9")
+    finally:
+        os.umask(old)
+    folder = lp.storage / "loop-widgetd"
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    assert stat.S_IMODE((folder / "session.environ").stat().st_mode) == 0o600
+    assert stat.S_IMODE((folder / "config.orig").stat().st_mode) == 0o600
+    assert "SESSION_VAR" in (folder / "session.environ").read_text()
+
+
+def test_help_says_the_environment_values_are_briefly_in_argv():
+    text = (TOOLS / "loop").read_text()
+    assert "argv" in text and "/proc/*/cmdline" in text

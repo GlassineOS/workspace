@@ -45,6 +45,9 @@ loop/<name>/loop.toml, one per binary. The commands in it are shell on the devic
   start = "..."                     run with the session's own environment
   reexec = "..."                    if it can re-execute itself, up uses that, and no windows close
   environment_from = "NAME"         the process whose environment start gets: the binary itself by default
+                                    Saved from /proc before anything stops, in the override's folder (0700, the file 0600),
+                                    until a restore succeeds. Starting puts its values in argv for a moment, so any process
+                                    on the device can read them in /proc/*/cmdline then
   stop_seconds = 15
   start_seconds = 15
 
@@ -204,7 +207,7 @@ def build(r, folder: Path) -> Path:
 def copy(device, r, binary: Path, sha: str) -> None:
     """Text through dev's one seam. The hash on the device decides."""
     folder = shlex.quote(r.folder)
-    device.do(f"rm -rf {folder} && mkdir -p {folder} && : > {folder}/binary")
+    device.do(f"rm -rf {folder} && (umask 077; mkdir -p {folder}) && : > {folder}/binary")
     with open(binary, "rb") as f:
         while chunk := f.read(CHUNK):
             text = base64.encodebytes(chunk).decode()

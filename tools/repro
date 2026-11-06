@@ -37,9 +37,12 @@ and the source's and binary's hashes, and stores the result in artifacts/repro w
 The output goes to a log there, not to the terminal. It warns on a base other than --base, on a binary other
 than earlier results on that base had, and on anything bound over a live binary. Exit: 0 pass, 1 fail, 77 skipped.
 
-gate lists what's missing or failed for a base, from results alone, and runs nothing. A patch named with
---patches or --patch that no reproducer's fixes names gets a "no reproducer" row. Exit 1 on missing or failed;
-a "no reproducer" row is a statement about an old patch, and warnings are warnings: neither fails it.
+gate lists what's missing or failed for a base, from results alone, and runs nothing. The last result on the base
+counts. A pass that ran over a binary bound over a live one isn't the base's own, so it's "bound", not "pass", and
+fails the gate until a run without the bind passes. A patch named with --patches or --patch that no reproducer's
+fixes names gets a "no reproducer" row. Exit 1 on missing, failed or bound; a "no reproducer" row is a statement
+about an old patch, and the other warnings (a dirty device, differing binaries, an unknown binary) are warnings:
+they don't fail it.
 """
 from __future__ import annotations
 
@@ -165,6 +168,7 @@ def inside(a) -> int:
               "fixes": r["fixes"], "does": r["does"], "tool_commit": commit, "tool_changed": changed, "by": a.name or a.by,
               "time": wslib.utc(), "stamp": stamp, "warnings": notes, "log": log_id}
     summary = {k: record[k] for k in ("reproducer", "base", "result", "binary_sha256", "source_sha256", "warnings")}
+    summary["bound"] = bool(stamp.get("bound"))  # the gate counts a pass over a bound binary as not the base's own
     entry = kitlib.store_result(record, "repro", name, f"reproducer {r['name']} on {base}: {result}", a.by, "repro", summary)
     print(f"{r['name']}: {result}: {why}. Result {entry['id']}, on {base}, in {ran.seconds} s")
     return 0 if result == "pass" else 1
@@ -217,7 +221,11 @@ def gate_rows(base: str, patches: list[str]) -> list[dict]:
         hashes = {e["repro"]["binary_sha256"] for e in results if e["repro"].get("binary_sha256")}
         if len(hashes) > 1:
             notes.append(f"results on this base ran {len(hashes)} different binaries")
-        rows.append({"reproducer": name, "state": "failed" if state != "pass" else "pass", "words": f"{state}, result {last['id']}, {last['made']}",
+        bound = state == "pass" and bool(last["repro"].get("bound"))
+        words = f"{state}, result {last['id']}, {last['made']}"
+        if bound:
+            words += ": it ran over a bound binary, which isn't the base's own, so it doesn't stand for the base"
+        rows.append({"reproducer": name, "state": "bound" if bound else "failed" if state != "pass" else "pass", "words": words,
                      "warnings": notes, "result": last["id"]})
     for patch in patches:
         if patch not in covered:
@@ -236,7 +244,7 @@ def gate(a) -> int:
                 print(f"{'':<14}   warning: {note}")
         if not rows:
             print(f"nothing to list for {a.base}: no reproducers, no patches named")
-    return 1 if any(row["state"] in ("missing", "failed") for row in rows) else 0
+    return 1 if any(row["state"] in ("missing", "failed", "bound") for row in rows) else 0
 
 
 def check(a) -> int:

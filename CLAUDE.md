@@ -92,7 +92,7 @@ tools/bench eye --binary X --setting K=V --content W --said W    # an eye test i
 - A test with a private input reports "skipped: no private input", never a pass.
 - **A reproducer's `does` comes from its `repro.toml`,** so a run can't start under a go that doesn't cover what it
   does. Its result names the base the device stamped, and warns when that isn't the base you said, when the binary differs
-  from earlier results there, or when something is bound over a live binary. A bound binary isn't the base's own.
+  from earlier results there, or when something is bound over a live binary. A bound binary isn't the base's own, so `repro gate` doesn't count a pass over one.
 - **One invalid arm invalidates a comparison,** and an invalid result prints no number. Don't dig its numbers out of the
   log to quote. A scroll run proves motion from counters `bench` reads itself. A device result names the kit that ran,
   by the Kit ID from `dev stamp` (the `kit_id` probe in `dev.toml`), not this checkout's commit, and without a Kit ID

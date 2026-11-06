@@ -428,7 +428,13 @@ def test_a_bound_binary_warns_and_says_so_at_the_gate(kit):
     kit.device.set("mountinfo", "20 1 0:20 /over /usr/bin/widget rw - ext4 /dev/root rw")
     assert "bound" in kit.repro("run", "widget-hang", "--as", "a").stderr
     assert kit.record(kit.results()[0])["stamp"]["bound"] == {"loop-widget": "/usr/bin/widget"}
-    assert "bound over a live binary" in kit.repro("gate", "base-7").stdout
+    done = kit.repro("gate", "base-7", code=1)  # it passed, but not as the base
+    assert done.stdout.startswith("bound") and "bound over a live binary" in done.stdout
+    assert json.loads(kit.repro("gate", "base-7", "--json", code=1).stdout)["rows"][0]["state"] == "bound"
+    kit.device.set("mountinfo", "20 1 0:20 / / rw - ext4 /dev/root rw\n")
+    (kit.device.store / "overrides.d" / "loop-widget").unlink()
+    kit.repro("run", "widget-hang", "--as", "a")  # a later run without the bind stands for the base
+    assert kit.repro("gate", "base-7").stdout.startswith("pass")
 
 
 def test_no_hash_in_the_stamp_says_so(kit):

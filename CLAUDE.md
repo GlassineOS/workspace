@@ -15,8 +15,8 @@ repository's own `CLAUDE.md` loads when you read its files, and applies inside i
 | `notes/` | what's known, per topic: `notes/<area>/<topic>.md`, its own local git with no remote | Ignored, on this host only. Goes through `notes`, or by hand with its pre-commit hook. |
 | `~/.cache/glassine/` | build output, kernel objects, downloads: what can be rebuilt | Anything may delete it. Nothing may point into it. |
 
-Lab notes and firmware still live outside this tree, in the lab directory, until they're indexed.
-Use `--add-dir` when a task needs them, and never copy any of it into a repository here.
+Lab notes and firmware still live outside this tree until they're indexed. Use `--add-dir`
+when a task needs them, and never copy any of it into a repository here.
 
 ## Working
 

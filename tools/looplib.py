@@ -309,6 +309,17 @@ def config_record(r: Recipe, owner: str, boot: str, key: str, value: str) -> tup
          ("removed", "now"), ("setting", key), ("config", r.config), ("binary", r.binary)])
 
 
+def bind_failed(r: Recipe, records: str) -> str:
+    """The bind didn't happen, so the target is the system's own and starting the process on it is safe: the rule that a
+    stopped process stays stopped is for one that might start on a bound binary. A re-exec recipe stopped nothing."""
+    gone = f"rm -f {quote(records + r.override)}"
+    if r.reexec:
+        return f"{{ {gone}; {fail(f'cannot bind over {r.target}: nothing was stopped and nothing is bound', 28)}; }}"
+    again = fail(f"cannot bind over {r.target}. {r.binary} was stopped for it and is started again on the original binary. Nothing is bound", 28)
+    stopped = fail(f"cannot bind over {r.target}, and {r.binary} is stopped and didn't start again: see {r.log}. Nothing is bound: reboot is the rollback", 28)
+    return f"{{ {gone}\nif (\n{start_block(r)}\n); then {again}; else {stopped}; fi\n}}"
+
+
 def up_script(recipes: list[Recipe], store: str, boot_probe: str, binds: str, owner: str, boot: str, shas: dict[str, str]) -> str:
     """Bind one binary, or a set together: everything prepared, then all stopped, all bound, all started."""
     records = store + "/overrides.d/"
@@ -325,7 +336,7 @@ def up_script(recipes: list[Recipe], store: str, boot_probe: str, binds: str, ow
     for r in recipes:
         # the record first: a connection lost here leaves a record with no bind, never a bind with no record
         out.append(devlib.put(records + r.override, record_lines(r, owner, boot, shas[r.name])))
-        out.append(f"mount --bind {quote(r.folder + '/binary')} {quote(r.target)} || {{ rm -f {quote(records + r.override)}; {fail(f'cannot bind over {r.target}', 28)}; }}")
+        out.append(f"mount --bind {quote(r.folder + '/binary')} {quote(r.target)} || {bind_failed(r, records)}")
         for key, value in r.settings.items():
             name, text = config_record(r, owner, boot, key, value)
             out.append(devlib.put(records + name, text))

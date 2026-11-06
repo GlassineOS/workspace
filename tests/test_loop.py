@@ -253,8 +253,21 @@ def test_a_bind_that_fails_leaves_no_record(lp):
     lp.recipe()
     lp.take("a")
     (lp.r / "mount-fails").touch()
-    lp.loop("up", "widgetd", "--as", "a", code=1)
+    done = lp.loop("up", "widgetd", "--as", "a", code=1)
     assert not lp.overrides() and not lp.bound()
+    assert running(lp)  # it was stopped for the bind, and nothing is bound, so it came back on the original binary
+    assert lp.log() == ["stop widgetd", f"mount --bind {lp.storage}/loop-widgetd/binary {lp.target}", "start widgetd"]
+    assert "started again on the original" in done.stderr
+
+
+def test_a_bind_that_fails_and_cant_start_it_again_says_it_is_stopped(lp):
+    lp.recipe()
+    lp.take("a")
+    (lp.r / "mount-fails").touch()
+    (lp.r / "wont-start").touch()
+    done = lp.loop("up", "widgetd", "--as", "a", code=1)
+    assert not running(lp) and not lp.overrides() and not lp.bound()
+    assert "widgetd is stopped" in done.stderr and "reboot" in done.stderr.lower()
 
 
 def test_the_wrong_binary_running_fails_and_run_restores(lp):

@@ -239,6 +239,9 @@ def bring_up(a, device, recipes) -> None:
     a.swapping = True  # from here anything may be bound, so loop run restores whatever happens
     done = device.run(script)
     sys.stderr.write(done.stderr)
+    if done.returncode == 28:
+        raise ToolError("on the device: exit 28: a bind failed, see above for what became of its process. Anything bound before it stays "
+                        "recorded: loop restore, or reboot, which is the rollback")
     if done.returncode:
         raise ToolError(f"on the device: exit {done.returncode}: anything bound stays recorded: loop restore, or reboot, which is the rollback")
     for r in recipes:

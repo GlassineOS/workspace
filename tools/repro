@@ -35,7 +35,14 @@ repro/<name>/repro.toml:
 run takes the lock through dev (or joins it, if WHO holds it), with --does from repro.toml, records dev stamp
 and the source's and binary's hashes, and stores the result in artifacts/repro with the base from the stamp.
 The output goes to a log there, not to the terminal. It warns on a base other than --base, on a binary other
-than earlier results on that base had, and on anything bound over a live binary. Exit: 0 pass, 1 fail, 77 skipped.
+than earlier results on that base had, and on anything bound over a live binary.
+
+Exit: 0 pass, 77 skipped (no private input here: no lock, no result), 1 for everything else. 1 is not only "the
+reproducer failed": it is also a lock that was refused (held, or a --does without a go), a repro.toml that isn't
+sound, a missing --as or --base, and a release that failed after a pass (the result is stored, and dev says so). The
+lock's exit status passes through dev take, so run can't tell these apart by code. What does: the words on stderr,
+and a result in artifacts/repro (or repro gate) only when it ran. A script that needs "didn't run" apart from "failed"
+should look for the stored result, not the code.
 
 gate lists what's missing or failed for a base, from results alone, and runs nothing. The last result on the base
 counts. A pass that ran over a binary bound over a live one isn't the base's own, so it's "bound", not "pass", and

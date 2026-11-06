@@ -36,7 +36,7 @@ class FakeDevice:
         self.env = env
         for name, text in {"clock": str(DAY_ON_THE_DEVICE), "boot_id": "boot-1", "hangchecks": "0", "renderer": "gles2",
                            "mountinfo": "20 1 0:20 / / rw - ext4 /dev/root rw\n", "settings": "@a=1\n@b=2\n", "seed": "@a=1\n@b=2\n",
-                           "commit": "abc123"}.items():
+                           "commit": "abc123", "kit_id": "kit-3"}.items():
             (self.root / name).write_text(text + ("" if text.endswith("\n") else "\n"))
         self._script(self.bin / "date", f'cat "{self.root}/clock"')
         self._script(self.root / "fake-ssh", f"""root="{self.root}"
@@ -68,7 +68,7 @@ exit $code""")
                   "compositor": "nosuchprocess", **more}
         lines = [f"{k} = {json.dumps(v)}" for k, v in values.items()] + ["[probes]"]
         probes = {"boot_id": f"cat {r}/boot_id", "hangchecks": f"cat {r}/hangchecks", "binds": f"cat {r}/mountinfo", "renderer": f"cat {r}/renderer",
-                  "base": "echo base-7", "deployment": "echo dep-7", "boot_image": "echo boot-img", "bases": "echo base-6 base-7",
+                  "kit_id": f"cat {r}/kit_id", "base": "echo base-7", "deployment": "echo dep-7", "boot_image": "echo boot-img", "bases": "echo base-6 base-7",
                   "compositor_commit": f"cat {r}/commit", "battery_temp": "echo 300", "charging": "echo Discharging",
                   "gpu_min_clock": "echo 430000000", "open_apps": "echo foot"}
         lines += [f"{k} = {json.dumps(v)}" for k, v in probes.items()]
@@ -948,7 +948,7 @@ def test_stamp_has_the_fields_and_says_what_it_doesnt_know(rig):
     d.override("tune", owner="a", boot_id="boot-1", setting="@x", value="9")
     d.set("settings", "@a=1\n@b=2\n@x=9")
     out = json.loads(rig.dev("stamp", "--json").stdout)
-    assert out["base"] == "base-7" and out["boot_image"] == "boot-img" and out["renderer"] == "gles2"
+    assert out["kit_id"] == "kit-3" and out["base"] == "base-7" and out["boot_image"] == "boot-img" and out["renderer"] == "gles2"
     assert out["compositor_commit"] == "abc123" and out["fallback_flag"] == "clear" and out["charging"] == "Discharging"
     assert out["open_apps"] == "foot" and out["gpu_min_clock"] == "430000000" and out["battery_temp"] == "300"
     assert out["live_settings"] == {"tune": "9 (recorded, unconfirmed)"}

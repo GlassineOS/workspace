@@ -91,7 +91,8 @@ tools/loop up NAME --as NAME; tools/loop restore NAME --as NAME  # the same in t
   on a device until someone with a go has run them.
 - **Notes say where each claim comes from:** `seen` (a base and a command or artifact), `inferred` (from which
   claims), `guess`, `user` or `archive`. Current takes only `seen`, `user` and `inferred` resting on Current, so a
-  guess can't rise by being repeated. Nothing is deleted: what's replaced or retracted goes to Log, marked. `add` and
+  guess can't rise by being repeated. What's replaced or retracted goes to Log, marked. A claim that a Current claim
+  shows wrong may be deleted (`notes set --delete cN --by cM --why WORDS`); only its id, the date and why stay. `add` and
   `set` refuse the whole write on a lint problem or a scan flag. The scan catches patterns, not prose or decoded
   output, so what's private stays in `artifacts/`, named by id. Work others need is an issue, with no note text.
 - **`notes find` rows say what they are:** `current`, `open`, `history`, `retracted` or `archive, unreviewed`. Read

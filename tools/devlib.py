@@ -4,13 +4,15 @@
 Everything on the device goes through Device.run, a shell script on the stdin of a configurable ssh
 command, so each step can also be done by hand and tests can run it against a local folder. The
 scripts use plain POSIX sh and the device's own clock. They never read the daemon's /run files: the
-control FIFO blocks whoever reads it. A setting or probe that points there is refused on loading.
+control FIFO blocks whoever reads it. A setting or probe that points there is refused on loading, but
+that is a tripwire for a slip, not a guarantee: see touches_run.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import socket
@@ -29,8 +31,8 @@ TEXT_CAP = 200  # purpose, notice and other free text: data for agents, so cappe
 HUB_SECONDS = 3.0  # past this the hub counts as down
 
 DEFAULTS = {
-    "name": "note-air-1",
-    "ssh": "ssh -o BatchMode=yes -o ConnectTimeout=5 root@172.16.42.1",
+    "name": "device",  # what reports and the hub call it; dev.toml names it
+    "ssh": "",  # the whole ssh command to the device, with its user and address: dev.toml or GLASSINE_DEV_SSH
     "store": "/root/glassine-dev",  # unverified: must survive a reboot, a deployment switch and a rollback
     "ssh_seconds": 30,
     "settings": "",  # the settings file the seed is compared with: particular to a device
@@ -46,7 +48,9 @@ DEFAULTS = {
 }
 
 # Plain kernel interfaces. What's particular to a device has no default: it's set in dev.toml, and
-# until then the check and the stamp say "unknown".
+# until then the check and the stamp say "unknown". kit_id is one of those: it prints the Kit ID file on the
+# root file system (docs: Boot flow, Interfaces), which says which kit is installed: the modules and
+# device files a kernel image carries. No path is set anywhere yet.
 DEFAULT_PROBES = {
     "boot_id": "cat /proc/sys/kernel/random/boot_id",
     "hangchecks": "d=$(dmesg) || exit 1; printf '%s\\n' \"$d\" | grep -c hangcheck; exit 0",
@@ -57,13 +61,17 @@ DEFAULT_PROBES = {
 }
 CHECK_PROBES = ("renderer", "hangchecks", "binds", "_fallback", "_settings", "_seed")
 REPORT_PROBES = ("renderer", "base", "deployment", "boot_image", "bases", "_free_kb")
-STAMP_PROBES = ("renderer", "_fallback", "base", "boot_image", "compositor_sha256", "compositor_commit",
+STAMP_PROBES = ("renderer", "_fallback", "kit_id", "base", "boot_image", "compositor_sha256", "compositor_commit",
                 "daemon_sha256", "daemon_commit", "open_apps", "gpu_min_clock", "battery_temp", "charging")
 
 _RUN = re.compile(r"(?<![\w.$}-])(?:/var)?/run(?![\w.-])")
 
 
 def touches_run(text: str) -> bool:
+    """Whether a setting or probe names /run in one of its plain spellings. It is a text match: a tripwire for a slip, not
+    a guarantee. It misses /usr/../run, /./run, /proc/1/root/run, /ru''n, /r*n, and `cd / && cat run/x`, so whoever writes
+    dev.toml has to mean it. It looks for /run only: other reads that crash a SoC, which the device pages list, are not
+    checked for, and the scripts dev writes itself avoid them by what they read, not by this test."""
     return bool(_RUN.search(text))
 
 
@@ -187,6 +195,9 @@ class State:
 class Device:
     def __init__(self, config: Config):
         self.config = config
+        if not config.ssh.strip():
+            raise wslib.ToolError("no way to reach the device: set GLASSINE_DEV_SSH, or ssh in dev.toml, "
+                                  "to the ssh command, e.g. ssh -o BatchMode=yes root@HOST")
         self.argv = shlex.split(config.ssh)
         self.quoted = shlex.quote(config.store)
 
@@ -195,8 +206,8 @@ class Device:
         try:
             done = subprocess.run([*self.argv, "sh -s"], input=script, capture_output=True, text=True,
                                   timeout=self.config.ssh_seconds)
-        except subprocess.TimeoutExpired:
-            raise wslib.ToolError(f"the device didn't answer in {self.config.ssh_seconds} s; nothing is known") from None
+        except subprocess.TimeoutExpired:  # a device that is rebooting can hang rather than refuse: the same as unreachable
+            raise Unreachable(f"the device didn't answer in {self.config.ssh_seconds} s; nothing is known") from None
         except OSError as e:
             raise wslib.ToolError(f"can't run {self.argv[0]}: {e}") from e
         if done.returncode == 255:
@@ -231,31 +242,78 @@ class Device:
         return None
 
     def read(self, probes=()) -> State:
-        """Everything in the store, and the named probes. Only regular files, so a stray FIFO can't block."""
+        """Everything in the store, and the named probes. Only regular files, so a stray FIFO can't block.
+
+        Every line the script adds to what it reads starts with a mark made for this call, which nothing stored on the
+        device or printed by a probe can know, so free text can't pass for one."""
+        mark = "@@dev-" + secrets.token_hex(8) + ":"
         lines = [
-            "printf '@@dev:now %s\\n' \"$(date +%s)\"",
+            f"printf '{mark}now %s\\n' \"$(date +%s)\"",
             f"if cd {self.quoted} 2>/dev/null; then",
-            "  [ -d lock.d ] && echo @@dev:locked",
+            f"  [ -d lock.d ] && echo {mark}locked",
             "  for f in lock.d/* queue.d/* overrides.d/* left.d/* hangcheck-base last-release; do",
-            "    if [ -f \"$f\" ]; then printf '@@dev:file %s\\n' \"$f\"; cat \"$f\"; echo; fi",
+            f"    if [ -f \"$f\" ]; then printf '{mark}file %s\\n' \"$f\"; cat \"$f\"; echo; fi",
             "  done",
             "fi",
         ]
         for name in ("boot_id", *probes):
             command = self.probe_command(name)
             if command is not None:
-                lines += [f"echo '@@dev:probe {name}'", f"( {command}\n) 2>/dev/null </dev/null", "printf '\\n@@dev:rc %s\\n' \"$?\""]
+                lines += [f"echo '{mark}probe {name}'", f"( {command}\n) 2>/dev/null </dev/null", f"printf '\\n{mark}rc %s\\n' \"$?\""]
         done = self.run("\n".join(lines) + "\n")
         if done.returncode:
             raise wslib.ToolError(f"reading the device: exit {done.returncode}: {done.stderr.strip()}")
-        return parse_read(done.stdout)
+        return parse_read(done.stdout, mark)
 
 
 class Unreachable(wslib.ToolError):
-    """ssh itself failed: the device is off, rebooting or not plugged in."""
+    """ssh itself failed or didn't answer in time: the device is off, rebooting or not plugged in."""
 
 
-def parse_read(text: str) -> State:
+# --- the take behind a lock: lock.d/running names the process on this host whose CMD the lock is held for
+
+def proc_stat(pid: int) -> tuple[str, str] | None:
+    """(state, start time) of a process on this host, or None if there's none. Only /proc/PID/stat is read."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    rest = text.rpartition(")")[2].split()  # the name in front may hold spaces and brackets
+    return (rest[0], rest[19]) if len(rest) > 19 else None
+
+
+def pid_namespace() -> str:
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
+def take_record(pid: int) -> str:
+    """What a take writes to lock.d/running, so a later release can tell whether that take is still there."""
+    found = proc_stat(pid)
+    return fields_text([("host", socket.gethostname()), ("pid", pid), ("start", found[1] if found else ""), ("ns", pid_namespace())])
+
+
+def take_has_ended(record: str) -> bool | None:
+    """Whether the take that wrote this record is gone: True or False, or None when this host can't tell. That's another
+    host or pid namespace, a record it can't read (an empty one from an older dev), or no /proc."""
+    fields = parse_fields(record)
+    pid = fields.get("pid", "")
+    if not pid.isdigit() or fields.get("host") != socket.gethostname() or not Path("/proc/self/stat").exists():
+        return None
+    if fields.get("ns") and fields["ns"] != pid_namespace():
+        return None
+    try:
+        found = proc_stat(int(pid))
+    except OSError:
+        return None
+    if found is None or found[0] in ("Z", "X"):
+        return True
+    return bool(fields.get("start")) and fields["start"] != found[1]  # a different start time: the pid is someone else's now
+
+
+def parse_read(text: str, mark: str = "@@dev:") -> State:
     state = State()
     kind, name, body = None, None, []
 
@@ -264,8 +322,8 @@ def parse_read(text: str) -> State:
             state.files[name] = "\n".join(body).rstrip("\n")
 
     for line in text.splitlines():
-        if line.startswith("@@dev:"):
-            tag, _, rest = line[6:].partition(" ")
+        if line.startswith(mark):
+            tag, _, rest = line[len(mark):].partition(" ")
             if tag == "now":
                 state.now = int(rest) if rest.isdigit() else 0
             elif tag == "locked":
@@ -391,23 +449,36 @@ def move_hangcheck_base(st: State) -> str:
     return put("hangcheck-base", f"{st.boot} {got[1]}")
 
 
-def run_cmd(cmd: list[str]) -> int:
-    """CMD on this host. A signal to dev goes on to it, and dev carries on to the release."""
-    try:
-        child = subprocess.Popen(cmd)
-    except OSError as e:
-        print(f"dev: can't run {cmd[0]}: {e}", file=sys.stderr)
-        return 127
+SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def run_cmd(cmd: list[str], after=None) -> int:
+    """CMD on this host. A signal to dev goes on to it, and dev carries on to the release.
+
+    The handlers that forward are in place before CMD starts, and a signal that comes first waits for it, so none lands
+    between the two and escapes as a Stop. When CMD has ended the signals go back to what they were, or to `after`."""
+    child = None
+    early = []
 
     def forward(signum, _frame):
-        child.send_signal(signum)
+        if child is None:
+            early.append(signum)
+        else:
+            child.send_signal(signum)
 
-    old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    old = {s: signal.signal(s, forward) for s in SIGNALS}
     try:
+        try:
+            child = subprocess.Popen(cmd)
+        except OSError as e:
+            print(f"dev: can't run {cmd[0]}: {e}", file=sys.stderr)
+            return 127
+        for signum in early:
+            child.send_signal(signum)
         code = child.wait()
     finally:
         for s, handler in old.items():
-            signal.signal(s, handler)
+            signal.signal(s, handler if after is None else after)
     return 128 - code if code < 0 else code
 
 

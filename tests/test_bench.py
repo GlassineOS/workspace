@@ -95,25 +95,46 @@ def test_settings_reach_the_run(b):
     assert 'arm=b2 settings={"speed": 2, "mode": "quick one"}' in log
 
 
-def test_every_result_records_the_kits_commit_and_the_stamp(b):
+def test_every_result_records_the_kit_the_tool_and_the_stamp(b):
     commit = b.plain()
-    b.bench("run", "widget-speed", "--as", "a")
+    done = b.bench("run", "widget-speed", "--as", "a")
+    assert "kit kit-3 on base base-7" in done.stdout
     record = b.only()
-    assert record["kit_commit"] == commit and record["kit_changed"] is False
-    assert record["stamp"]["base"] == "base-7" and record["stamp_after"]["base"] == "base-7"
+    assert record["kit_id"] == "kit-3" and record["base"] == "base-7"
+    assert record["tool_commit"] == commit and record["tool_changed"] is False
+    assert record["stamp"]["kit_id"] == "kit-3" and record["stamp_after"]["kit_id"] == "kit-3"
+    assert b.stored()[0]["bench"]["kit_id"] == "kit-3"
 
 
-def test_a_kit_with_changes_on_top_says_so(b):
+def test_a_checkout_with_changes_on_top_says_so(b):
     b.plain(commit=False)
     assert "changes on top" in b.bench("run", "widget-speed", "--as", "a").stderr
-    assert b.only()["kit_changed"] is True
+    assert b.only()["tool_changed"] is True
 
 
-def test_no_kit_commit_means_no_run(b):
+def test_no_tool_commit_means_no_run(b):
     b.plain()
     shutil.rmtree(b.kit / ".git")
-    assert "kit's commit" in b.bench("run", "widget-speed", "--as", "a", code=1).stderr
+    assert "definition's commit" in b.bench("run", "widget-speed", "--as", "a", code=1).stderr
     assert not b.device.log.exists() and not b.stored()
+
+
+def test_no_kit_id_means_nothing_runs(b):
+    b.plain(script=f'touch "{b.tmp}/ran"\necho "bench: x 1"\n')
+    (b.device.root / "kit_id").unlink()
+    assert "no Kit ID" in b.bench("run", "widget-speed", "--as", "a", code=1).stderr
+    assert not (b.tmp / "ran").exists() and not b.stored() and not b.device.lock.exists()
+
+
+def test_an_unknown_binary_means_nothing_runs(b):
+    b.write("widget-speed", f'what = "x"\nkind = "plain"\nrounds = 1\n{SOURCE}{RUN}binary = "compositor"\n{ARMS}',
+            f'touch "{b.tmp}/ran"\necho "bench: x 1"\n')
+    assert "no compositor_sha256" in b.bench("run", "widget-speed", "--as", "a", code=1).stderr
+    assert not (b.tmp / "ran").exists() and not b.stored()
+    toml = b.home / "dev.toml"
+    toml.write_text(toml.read_text() + 'compositor_sha256 = "echo c0ffee"\n')
+    b.bench("run", "widget-speed", "--as", "a")
+    assert b.only()["binary_sha256"] == "c0ffee"
 
 
 def test_results_go_to_the_store_and_the_kit_stays_clean(b):
@@ -130,6 +151,15 @@ def test_the_lock_comes_from_dev_with_does_from_the_toml(b):
     assert not b.device.lock.exists() and not b.stored()
     b.bench("run", "widget-speed", "--as", "a", "--go-said", "go ahead")
     assert (b.tmp / "does").read_text() == "close-apps\n" and not b.device.lock.exists()
+
+
+def test_inside_runs_only_under_the_lock(b):
+    b.plain(top='does = ["close-apps"]', script=f'touch "{b.tmp}/ran"\necho "bench: x 1"\n')
+    assert "isn't held by nobody" in b.bench("_inside", "widget-speed", "--as", "nobody", code=1).stderr
+    assert "--as" in b.bench("_inside", "widget-speed", code=1).stderr
+    b.take("a")
+    assert "doesn't cover close-apps" in b.bench("_inside", "widget-speed", "--as", "a", code=1).stderr
+    assert not (b.tmp / "ran").exists() and not b.stored()
 
 
 def test_a_held_lock_stays(b):
@@ -155,9 +185,28 @@ def test_one_invalid_arm_invalidates_the_comparison_and_prints_no_number(b, scri
     record = b.only()
     assert record["valid"] is False and record["summary"] is None
     assert all(r["metrics"] is None for r in record["runs"])  # the good arm's number isn't kept either
+    assert record["stamp_after"] is None  # never read, so not shown as if it were
     assert [r["arm"] for r in record["runs"]] == ["a1", "b2"]  # it stopped there
     shown = b.bench("show", b.stored()[0]["id"]).stdout
     assert "INVALID" in shown and "median" not in shown
+
+
+@pytest.mark.parametrize("lines, words", [
+    ('echo "bench: frame_ms 100"\necho "bench: frame_ms 1"', "printed twice"),
+    ('echo "bench: frame_ms 1e999"', "isn't a finite number"),
+    ('echo "bench: frame_ms 1"\necho "bench: dropped nan"', "doesn't parse"),
+    ('echo "bench: frame_ms 1"\necho "bench: dropped"', "doesn't parse"),
+])
+def test_bad_metric_lines_invalidate_the_arm(b, lines, words):
+    b.plain(script=lines + "\n", rounds=1)
+    done = b.bench("run", "widget-speed", "--as", "a", code=1)
+    assert words in done.stdout and "median" not in done.stdout
+    assert b.only()["runs"][0]["arm"] == "a1"  # the first arm, and it stopped there
+
+
+def test_a_device_script_reading_stdin_doesnt_eat_the_rest(b):
+    b.plain(script='cat >/dev/null\necho "bench: x 1"\n', rounds=1)
+    b.bench("run", "widget-speed", "--as", "a")
 
 
 def test_a_timeout_is_invalid(b):
@@ -178,6 +227,11 @@ def test_a_binary_changed_under_the_run_invalidates_it(b):
     b.device.set("hash", "a" * 64)
     b.plain(script=f'echo {"b" * 64} > "{b.device.root}/hash"\necho "bench: x 1"\n', rounds=1)
     assert "compositor_sha256 changed" in b.bench("run", "widget-speed", "--as", "a", code=1).stdout
+
+
+def test_a_kit_changed_under_the_run_invalidates_it(b):
+    b.plain(script=f'echo kit-4 > "{b.device.root}/kit_id"\necho "bench: x 1"\n', rounds=1)
+    assert "kit_id changed during the run" in b.bench("run", "widget-speed", "--as", "a", code=1).stdout
 
 
 def test_a_device_gone_after_the_run_keeps_an_invalid_result(b):
@@ -227,6 +281,13 @@ def test_an_unreadable_counter_proves_nothing(b):
     assert b.only()["motion_proved"] is False
 
 
+def test_a_counter_unreadable_after_the_arm_proves_nothing(b):
+    b.scroll(script=f'echo gone > "{b.device.root}/counter"\necho "bench: frame_ms 9"\n')
+    done = b.bench("run", "widget-scroll", "--as", "a", code=1)
+    assert "went 0 to None" in done.stdout
+    assert b.only()["motion_proved"] is False
+
+
 def test_every_arm_must_prove_it(b):
     script = f'case "$GLASSINE_BENCH_ARM" in a1) n=$(cat "{b.device.root}/counter"); echo $((n + 50)) > "{b.device.root}/counter";; esac\necho "bench: frame_ms 9"\n'
     b.scroll(script=script)
@@ -253,6 +314,25 @@ def test_gpu_host_with_no_process_list_is_invalid(b):
     (fake / "ps").chmod(0o755)
     b.env["PATH"] = f"{fake}:{b.env['PATH']}"
     assert "isn't known" in b.bench("run", "gpu", code=1).stdout
+
+
+def test_a_host_run_off_the_device_isnt_told_how_to_reach_it(b):
+    b.write("host", f'what = "x"\nkind = "plain"\ndevice = false\nrounds = 1\n{SOURCE}[run]\nwhere = "host"\ncommand = ["sh", "{{source}}"]\ntimeout = "1m"\n{ARMS}',
+            '[ -z "$GLASSINE_DEV_SSH$GLASSINE_DEV_STORE" ] && echo "bench: x 1"\n')
+    b.bench("run", "host")
+    assert b.only()["kit_id"] is None and "on this host" in b.bench("show", b.stored()[0]["id"]).stdout
+
+
+def test_source_and_dir_are_filled_in_within_an_argument(b):
+    command = '["sh", "-c", "sh \\"${1#--src=}\\"", "x", "--src={source}"]'
+    b.write("host", f'what = "x"\nkind = "plain"\ndevice = false\nrounds = 1\n{SOURCE}[run]\nwhere = "host"\ncommand = {command}\ntimeout = "1m"\n{ARMS}',
+            'echo "bench: x 1"\n')
+    b.bench("run", "host")
+
+
+def test_a_plan_longer_than_the_lock_is_warned_of(b):
+    b.plain(top='expect = "1m"')
+    assert "longer than expect" in b.bench("run", "widget-speed", "--as", "a").stderr
 
 
 def input_bench(b, ident):
@@ -293,6 +373,7 @@ def test_an_eye_test_is_a_result_with_user_provenance(b):
     record = b.only()
     assert record["provenance"] == "user" and record["settings"] == {"speed": "2", "mode": "quick one"}
     assert record["content"] == "a made-up page" and len(record["binary_sha256"]) == 64 and record["stamp"]["base"] == "base-7"
+    assert record["kit_id"] == "kit-3"
     entry = b.stored()[0]
     assert entry["bench"]["provenance"] == "user"
     assert "eye test" in b.bench("results").stdout
@@ -336,7 +417,7 @@ def test_results_list_ids_and_validity_without_numbers(b):
     b.plain(script='echo "bench: frame_ms 123.5"\n', rounds=1)
     b.bench("run", "widget-speed", "--as", "a")
     listed = b.bench("results", "widget-speed").stdout
-    assert " valid " in listed and "123.5" not in listed
+    assert " valid " in listed and "kit kit-3" in listed and "123.5" not in listed
     assert b.bench("results", "other").stdout == ""
     assert "123.5" in b.bench("show", b.stored()[0]["id"]).stdout
 
@@ -362,6 +443,7 @@ def test_show_refuses_what_isnt_a_bench_result(b):
     (f'what = "x"\nkind = "plain"\nrounds = 1\n{SOURCE}{RUN}[motion]\nread = "x"\nat_least = 1\n{ARMS}', "is for kind = scroll"),
     (f'what = "x"\nkind = "scroll"\nrounds = 1\n{SOURCE}{RUN}[motion]\nread = "cat /run/widget.count"\nat_least = 1\n{ARMS}', "FIFO"),
     (f'what = "x"\nkind = "scroll"\nrounds = 1\n{SOURCE}{RUN}[motion]\nread = "x"\nat_least = 0\n{ARMS}', "at_least"),
+    (f'what = "x"\nkind = "plain"\nrounds = 1\n[source]\nfile = "nope.sh"\n{RUN}{ARMS}', "file nope.sh isn't there"),
     (f'what = "x"\nkind = "gpu-host"\nrounds = 1\n{SOURCE}{RUN}{ARMS}', "where = host"),
     (f'what = "x"\nkind = "scroll"\ndevice = false\nrounds = 1\n{SOURCE}[run]\nwhere = "host"\ncommand = ["x"]\ntimeout = "1m"\n[motion]\nread = "x"\nat_least = 1\n{ARMS}', "device can't"),
 ])
@@ -369,6 +451,12 @@ def test_bad_definitions_are_refused_in_words(b, toml, words):
     b.write("bad", textwrap.dedent(toml))
     assert words in b.bench("check", code=1).stderr
     assert words in b.bench("run", "bad", "--as", "a", code=1).stderr
+    assert not b.device.log.exists()
+
+
+def test_a_device_script_that_reads_run_is_refused(b):
+    b.plain(script="cat /run/glassine/ctl\n")
+    assert "FIFO" in b.bench("check", code=1).stderr
     assert not b.device.log.exists()
 
 

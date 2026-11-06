@@ -28,7 +28,7 @@ from wslib import ToolError
 
 TOOLS = Path(__file__).resolve().parent
 SKIPPED = 77  # never 0: a skip chained with && must not read as a pass
-_ARTIFACT_ID = re.compile(rf"[0-9a-f]{{{artstore.ID_LENGTH},64}}")
+_ARTIFACT_ID = re.compile(rf"[0-9a-f]{{{artstore.ID_LENGTH}}}|[0-9a-f]{{64}}")  # what artstore.resolve matches: the id or the whole sha256
 _ACTION = re.compile(r"[a-z0-9][a-z0-9-]*")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _WRITE_TARGET = re.compile(r">>?\s*(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
@@ -45,7 +45,10 @@ def root() -> Path:
 
 
 def reads_run(text: str) -> bool:
-    """Whether shell reads or globs /run. Reading the daemon's FIFO blocks; writing to one is how it's told things."""
+    """Whether shell reads or globs /run. Reading the daemon's FIFO blocks; writing to one is how it's told things.
+
+    A lint, not a boundary: it matches text, so a path built at run time (cd /; cat run/x, /ru?/x, ${D}n/x) passes.
+    What bounds a script that blocks anyway is its timeout, and ssh_seconds for a counter read."""
     return devlib.touches_run(_WRITE_TARGET.sub(" ", text)) or any(
         "*" in m[1] and devlib.touches_run(m[1]) for m in _WRITE_TARGET.finditer(text))
 
@@ -69,10 +72,21 @@ def read_toml(kind: str, name: str) -> tuple[dict, Path]:
     path = folder / f"{kind}.toml"
     if not path.is_file():
         raise ToolError(f"no {kind}/{name}/{kind}.toml")
+    within(folder, root() / kind, f"{kind}/{name}")
+    within(path, folder, f"{kind}/{name}/{kind}.toml")
     try:
         return tomllib.loads(path.read_text()), folder
     except tomllib.TOMLDecodeError as e:
         raise ToolError(f"{path}: {e}") from e
+
+
+def within(path: Path, folder: Path, what: str) -> Path:
+    """PATH, once symlinks are followed, must still be under FOLDER: a link can't take a definition's source
+    or the definition itself out of the folder it's reviewed in."""
+    resolved = path.resolve()
+    if not resolved.is_relative_to(folder.resolve()):
+        raise ToolError(f"{what}: {path} is a link that leaves {folder}: it has to stay inside")
+    return resolved
 
 
 def words_list(table: dict, key: str, where: str) -> list[str]:
@@ -117,7 +131,7 @@ def check_source(table: dict, where: str) -> dict:
     if len(source) != 1:
         raise ToolError(f"{where}: [source] is one of file or artifact")
     if "artifact" in source and not _ARTIFACT_ID.fullmatch(str(source["artifact"])):
-        raise ToolError(f"{where}: [source] artifact is an id, the start of its sha256: a private input goes by id")
+        raise ToolError(f"{where}: [source] artifact is an id ({artstore.ID_LENGTH} hex characters) or a whole sha256: a private input goes by id")
     if "file" in source and (Path(source["file"]).is_absolute() or ".." in Path(source["file"]).parts):
         raise ToolError(f"{where}: [source] file is inside the definition's folder")
     return source
@@ -162,19 +176,53 @@ def resolve_source(source: dict, folder: Path, where: str) -> Path:
     if "artifact" in source:
         return resolve_input(source["artifact"])
     path = folder / source["file"]
+    within(path, folder, f"{where} [source] file")
     if not path.is_file():
         raise ToolError(f"{where}: [source] file {source['file']} isn't there")
     return path
 
 
 def check_device_script(path: Path, where: str) -> None:
-    """A script for the device is held to the rule dev keeps: nothing reads or globs /run."""
+    """A script for the device is held to the rule dev keeps: nothing reads or globs /run. See reads_run: it's a lint."""
     try:
         text = path.read_text()
     except (UnicodeDecodeError, OSError) as e:
         raise ToolError(f"{where}: where = device runs the source as a shell script, and this isn't one: {e}") from None
     if reads_run(text):
         raise ToolError(f"{where}: the script reads or globs /run on the device, whose control FIFO blocks. Writing to it is fine")
+
+
+def fill_command(command: list[str], source: Path, folder: Path) -> list[str]:
+    """A host command with {source} and {dir} filled in, anywhere in an argument: --src={source} too."""
+    return [x.replace("{source}", str(source)).replace("{dir}", str(folder)) for x in command]
+
+
+def host_env(device: bool, **more: str) -> dict:
+    """The environment of a host run. Only one under the lock is told how to reach the device."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GLASSINE_DEV_SSH", "GLASSINE_DEV_STORE")}
+    if device:
+        env["GLASSINE_DEV_SSH"] = devlib.load_config().ssh
+    return env | more
+
+
+def device_script(source: bytes, prefix: bytes = b"") -> bytes:
+    """What goes to the device's sh -s. The script is one { } group, which sh reads whole before running any of it,
+    with stdin from /dev/null: a command in it that reads stdin can't eat the rest of the script."""
+    return prefix + b"{\n" + source + (b"" if source.endswith(b"\n") else b"\n") + b"} </dev/null\n"
+
+
+def check_held(name: str | None, does: list[str]) -> None:
+    """_inside runs only under dev take: the lock is held by NAME, and its does covers this run's, which took a go."""
+    if not name:
+        raise ToolError("--as: this needs the device, and so the lock")
+    st = devlib.Device(devlib.load_config()).read()
+    if not st.locked or st.lock.get("owner") != name:
+        holder = st.lock.get("owner") or "nobody"
+        raise ToolError(f"the lock isn't held by {name} (held by {holder}): this runs only under dev take, which run uses")
+    held = [x for x in st.lock.get("does", "").split(",") if x]
+    missing = [x for x in does if x not in held]
+    if missing:
+        raise ToolError(f"the lock's does doesn't cover {','.join(missing)}, so no go does: this runs only under dev take")
 
 
 def dev(*args: str, **kw) -> subprocess.CompletedProcess:
@@ -209,7 +257,10 @@ def stamp() -> dict:
         done = dev(command, "--json", capture_output=True, text=True)
         if done.returncode:
             raise ToolError(f"no {command}, so nothing runs that couldn't be recorded: {done.stderr.strip()}")
-        got[name] = json.loads(done.stdout)
+        try:
+            got[name] = json.loads(done.stdout)
+        except ValueError as e:
+            raise ToolError(f"dev {command} printed what isn't JSON: {e}") from None
     bound = {k: v.get("target") for k, v in (got["status"].get("overrides") or {}).items() if v.get("target")}
     return {**got["stamp"], "bound": bound}
 
@@ -226,8 +277,9 @@ def binary_hash(stamp_: dict, binary: str | None) -> str | None:
     return stamped(stamp_, binary)
 
 
-def kit_commit() -> tuple[str | None, bool]:
-    """The commit of the checkout the definitions came from, and whether it had changes on top."""
+def tool_commit() -> tuple[str | None, bool]:
+    """The commit of the checkout the definitions and tools came from, and whether it had changes on top.
+    It's the tool's version. What ran on the device is the stamp's kit_id and base."""
     here = str(root())
     head = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True)
     if head.returncode:

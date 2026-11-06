@@ -76,6 +76,16 @@ def set_probe(kit, name, command):
 # --- running under the lock
 
 
+def test_inside_runs_only_under_the_lock(kit):
+    kit.simple(script=f'touch "{kit.tmp}/ran"\n', top='does = ["close-apps"]')
+    set_probe(kit, "compositor_sha256", "echo c0ffee")
+    assert "isn't held by nobody" in kit.repro("_inside", "widget-hang", "--as", "nobody", code=1).stderr
+    assert "--as" in kit.repro("_inside", "widget-hang", code=1).stderr
+    kit.take("a")
+    assert "doesn't cover close-apps" in kit.repro("_inside", "widget-hang", "--as", "a", code=1).stderr
+    assert not (kit.tmp / "ran").exists() and not kit.results()
+
+
 def test_a_run_stores_the_result_with_stamp_and_hashes_and_frees_the_lock(kit):
     kit.simple(more='[pass]\noutput_has = "fine"')
     set_probe(kit, "compositor_sha256", "echo c0ffee")
@@ -86,7 +96,7 @@ def test_a_run_stores_the_result_with_stamp_and_hashes_and_frees_the_lock(kit):
     record = kit.record(entry)
     assert record["base"] == "base-7" and record["result"] == "pass" and record["binary_sha256"] == "c0ffee"
     assert record["stamp"]["base"] == "base-7" and record["stamp"]["device_time"]  # dev's stamp, as dev prints it
-    assert len(record["source_sha256"]) == 64
+    assert len(record["source_sha256"]) == 64 and record["stamp"]["kit_id"] == "kit-3"
     log = artstore_log(kit, record)
     assert log.read_text() == "fine\n"
 
@@ -201,7 +211,19 @@ def test_a_timeout_is_a_fail_and_the_lock_goes_back(kit):
         """, s_sh="sleep 60\n")
     done = kit.repro("run", "slow", "--as", "a", code=1)
     assert "timed out" in done.stdout and not kit.device.lock.exists()
+    assert "may still be running" not in done.stderr  # a host command is the process group this tool killed
     assert kit.results()[0]["repro"]["result"] == "fail"
+
+
+def test_a_device_timeout_warns_that_the_script_on_the_device_may_still_run(kit):
+    kit.simple("slow-device", script="sleep 60\n", more="")
+    toml = kit.kit / "repro" / "slow-device" / "repro.toml"
+    toml.write_text(toml.read_text().replace('timeout = "1m"', 'timeout = "1s"'))
+    done = kit.repro("run", "slow-device", "--as", "a", code=1)
+    assert "may still be running" in done.stderr
+    record = kit.record(kit.results()[0])
+    assert record["result"] == "fail" and any("may still be running" in w for w in record["warnings"])
+    assert "may still be running" in kit.repro("gate", "base-7", code=1).stdout
 
 
 def test_a_signal_is_stored_as_stopped_and_the_lock_goes_back(kit):
@@ -262,6 +284,52 @@ def test_a_host_only_reproducer_takes_no_lock_and_says_its_base(kit):
     assert record["base"] == "base-9" and record["binary_sha256"] == artstore.digest(binary)
 
 
+def host_only(kit, name="offline"):
+    return kit.define(name, """\
+        what = "never near the device"
+        device = false
+        [source]
+        file = "s.sh"
+        [run]
+        where = "host"
+        command = ["sh", "{source}"]
+        timeout = "1m"
+        """)
+
+
+def test_a_source_that_is_a_link_out_of_the_folder_is_refused(kit):
+    outside = kit.tmp / "outside.sh"
+    outside.write_text(f'touch "{kit.tmp}/ran"\n')
+    folder = host_only(kit)
+    (folder / "s.sh").symlink_to(outside)
+    assert "leaves" in kit.repro("check", code=1).stderr
+    assert "leaves" in kit.repro("run", "offline", "--base", "b", code=1).stderr
+    assert "leaves" in kit.repro("_inside", "offline", "--base", "b", code=1).stderr  # not only run's own check
+    assert not (kit.tmp / "ran").exists() and not kit.results()
+
+
+def test_a_source_that_is_a_link_inside_the_folder_is_fine(kit):
+    folder = host_only(kit)
+    (folder / "real.sh").write_text("echo fine\n")
+    (folder / "s.sh").symlink_to("real.sh")
+    kit.repro("check")
+    kit.repro("run", "offline", "--base", "b")
+    assert kit.record(kit.results()[0])["result"] == "pass"
+
+
+def test_a_definition_folder_or_toml_that_is_a_link_out_is_refused(kit):
+    elsewhere = kit.tmp / "elsewhere"
+    elsewhere.mkdir()
+    (kit.kit / "repro").mkdir()
+    (kit.kit / "repro" / "linked").symlink_to(elsewhere)
+    (elsewhere / "repro.toml").write_text('what="x"\n[source]\nfile="s"\n[run]\nwhere="host"\ncommand=["true"]\ntimeout="1m"\n')
+    assert "leaves" in kit.repro("check", "linked", code=1).stderr
+    folder = host_only(kit, "toml-linked")
+    (folder / "repro.toml").rename(kit.tmp / "moved.toml")
+    (folder / "repro.toml").symlink_to(kit.tmp / "moved.toml")
+    assert "leaves" in kit.repro("check", "toml-linked", code=1).stderr
+
+
 # --- private inputs
 
 
@@ -302,6 +370,27 @@ def test_a_private_input_thats_here_runs_and_is_named_by_id(kit):
     record = kit.record(kit.results()[0])
     assert record["inputs"] == [ident] and "captured" not in json.dumps(record)
     assert kit.results()[0]["from"] == [ident]
+
+
+def test_a_private_input_by_its_whole_sha256_runs_too(kit):
+    stream = kit.tmp / "stream"
+    stream.write_text("captured\n")
+    sha = artstore.digest(stream)  # art add moves the file
+    kit.tool("art", "add", stream, "--to", "captures", "--class", "user-data", "--what", "a stream", "--keep", "user")
+    kit.define("private", f"""\
+        what = "from a captured stream"
+        [source]
+        artifact = "{sha}"
+        [run]
+        where = "host"
+        command = ["cat", "{{source}}"]
+        timeout = "1m"
+        [pass]
+        output_has = "captured"
+        """)
+    kit.repro("check")
+    kit.repro("run", "private", "--as", "a")
+    assert kit.record(kit.results()[0])["result"] == "pass"
 
 
 def test_a_private_input_changed_on_disk_is_refused(kit):
@@ -351,7 +440,13 @@ def test_a_bound_binary_warns_and_says_so_at_the_gate(kit):
     kit.device.set("mountinfo", "20 1 0:20 /over /usr/bin/widget rw - ext4 /dev/root rw")
     assert "bound" in kit.repro("run", "widget-hang", "--as", "a").stderr
     assert kit.record(kit.results()[0])["stamp"]["bound"] == {"loop-widget": "/usr/bin/widget"}
-    assert "bound over a live binary" in kit.repro("gate", "base-7").stdout
+    done = kit.repro("gate", "base-7", code=1)  # it passed, but not as the base
+    assert done.stdout.startswith("bound") and "bound over a live binary" in done.stdout
+    assert json.loads(kit.repro("gate", "base-7", "--json", code=1).stdout)["rows"][0]["state"] == "bound"
+    kit.device.set("mountinfo", "20 1 0:20 / / rw - ext4 /dev/root rw\n")
+    (kit.device.store / "overrides.d" / "loop-widget").unlink()
+    kit.repro("run", "widget-hang", "--as", "a")  # a later run without the bind stands for the base
+    assert kit.repro("gate", "base-7").stdout.startswith("pass")
 
 
 def test_no_hash_in_the_stamp_says_so(kit):
@@ -422,6 +517,7 @@ def test_gate_with_a_patch_list_file(kit):
     ('what="x"\n[run]\nwhere="device"\ntimeout="1m"', "needs [source]"),
     ('what="x"\n[source]\nfile="r"\nartifact="0123456789ab"\n[run]\nwhere="device"\ntimeout="1m"', "one of"),
     ('what="x"\n[source]\nartifact="a-private-name"\n[run]\nwhere="device"\ntimeout="1m"', "goes by id"),
+    ('what="x"\n[source]\nartifact="0123456789abcdef"\n[run]\nwhere="device"\ntimeout="1m"', "goes by id"),  # a prefix resolve doesn't match
     ('what="x"\n[source]\nfile="../up"\n[run]\nwhere="device"\ntimeout="1m"', "inside"),
     ('what="x"\n[source]\nfile="r"\n[run]\nwhere="device"', "every run is bounded"),
     ('what="x"\n[source]\nfile="r"\n[run]\nwhere="moon"\ntimeout="1m"', "where is"),

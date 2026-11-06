@@ -35,18 +35,32 @@ repro/<name>/repro.toml:
 run takes the lock through dev (or joins it, if WHO holds it), with --does from repro.toml, records dev stamp
 and the source's and binary's hashes, and stores the result in artifacts/repro with the base from the stamp.
 The output goes to a log there, not to the terminal. It warns on a base other than --base, on a binary other
-than earlier results on that base had, and on anything bound over a live binary. Exit: 0 pass, 1 fail, 77 skipped.
+than earlier results on that base had, and on anything bound over a live binary.
 
-gate lists what's missing or failed for a base, from results alone, and runs nothing. A patch named with
---patches or --patch that no reproducer's fixes names gets a "no reproducer" row. Exit 1 on missing or failed;
-a "no reproducer" row is a statement about an old patch, and warnings are warnings: neither fails it.
+The timeout is a bound on this host. With where = "device" it ends the local ssh, and nothing here stops the script on
+the device: without a pty ssh doesn't signal the remote command when the client dies, so after a timeout or a signal
+the script may still run on the device while the lock goes back. The result says so in its warnings, and so does the
+terminal. Don't rely on the timeout to stop something that can hurt the device; write the script to bound itself.
+
+Exit: 0 pass, 77 skipped (no private input here: no lock, no result), 1 for everything else. 1 is not only "the
+reproducer failed": it is also a lock that was refused (held, or a --does without a go), a repro.toml that isn't
+sound, a missing --as or --base, and a release that failed after a pass (the result is stored, and dev says so). The
+lock's exit status passes through dev take, so run can't tell these apart by code. What does: the words on stderr,
+and a result in artifacts/repro (or repro gate) only when it ran. A script that needs "didn't run" apart from "failed"
+should look for the stored result, not the code.
+
+gate lists what's missing or failed for a base, from results alone, and runs nothing. The last result on the base
+counts. A pass that ran over a binary bound over a live one isn't the base's own, so it's "bound", not "pass", and
+fails the gate until a run without the bind passes. A patch named with --patches or --patch that no reproducer's
+fixes names gets a "no reproducer" row. Exit 1 on missing, failed or bound; a "no reproducer" row is a statement
+about an old patch, and the other warnings (a dirty device, differing binaries, an unknown binary) are warnings:
+they don't fail it.
 """
 from __future__ import annotations
 
 import argparse
 import getpass
 import json
-import os
 import re
 import subprocess
 import sys
@@ -70,6 +84,8 @@ def load(name: str) -> dict:
     common = kitlib.check_common(table, where)
     source = kitlib.check_source(table, where)
     run = kitlib.check_run(table, where, common["device"])
+    if "file" in source:
+        kitlib.within(folder / source["file"], folder, f"{where} [source] file")
     if run["where"] == "device" and "file" in source and (folder / source["file"]).is_file():
         kitlib.check_device_script(folder / source["file"], where)
     criterion = table.get("pass", {})
@@ -130,6 +146,8 @@ def warnings(r, a, stamp, base, binary) -> list[str]:
 def inside(a) -> int:
     """Under the lock when there is one: the stamp, the run, the result."""
     r = load(a.reproducer)
+    if r["device"]:
+        kitlib.check_held(a.name, r["does"])
     source = kitlib.resolve_source(r["source"], r["folder"], r["where"])
     stamp = kitlib.stamp() if r["device"] else {"device": None}
     base = kitlib.stamped(stamp, "base") or a.base or "unknown"
@@ -140,7 +158,7 @@ def inside(a) -> int:
     notes = warnings(r, a, stamp, base, binary)
     for note in notes:
         print(f"repro: warning: {note}", file=sys.stderr)
-    commit, changed = kitlib.kit_commit()
+    commit, changed = kitlib.tool_commit()
     name = kitlib.result_name("repro", r["name"])
     seconds = kitlib.duration(r["run"]["timeout"], r["where"])
     with kitlib.scratch("repro") as where:
@@ -148,24 +166,27 @@ def inside(a) -> int:
         if r["run"]["where"] == "device":
             config = devlib.load_config()
             kitlib.check_device_script(source, r["where"])
-            ran = kitlib.run_bounded([*devlib.Device(config).argv, "sh -s"], log, stdin=source.read_bytes(), seconds=seconds)
+            ran = kitlib.run_bounded([*devlib.Device(config).argv, "sh -s"], log, stdin=kitlib.device_script(source.read_bytes()), seconds=seconds)
         else:
-            fill = {"{source}": str(source), "{dir}": str(r["folder"])}
-            argv = [fill.get(x, x) for x in r["run"]["command"]]
-            env = {**os.environ}
-            if r["device"]:
-                env["GLASSINE_DEV_SSH"] = devlib.load_config().ssh
-            ran = kitlib.run_bounded(argv, log, seconds=seconds, env=env, cwd=r["folder"])
+            argv = kitlib.fill_command(r["run"]["command"], source, r["folder"])
+            ran = kitlib.run_bounded(argv, log, seconds=seconds, env=kitlib.host_env(r["device"]), cwd=r["folder"])
         log.touch()
+        if r["run"]["where"] == "device" and (ran.timed_out or ran.stopped):
+            cut = "timed out" if ran.timed_out else "stopped"
+            note = (f"{cut}: that ended the local ssh, not the script on the device, which may still be running while the lock "
+                    "goes back. Look at the device before anything else takes it")
+            notes.append(note)
+            print(f"repro: warning: {note}", file=sys.stderr)
         output = log.read_text(errors="replace")
         result, why = ("stopped", "stopped from outside") if ran.stopped else judge(r, ran, output)
         log_id = kitlib.store_log(log, "repro", name, f"output of reproducer {r['name']} on {base}", a.by)
     inputs = [r["source"]["artifact"]] if "artifact" in r["source"] else []
     record = {"reproducer": r["name"], "base": base, "result": result, "why": why, "exit": ran.code, "seconds": ran.seconds,
               "binary": r["run"].get("binary"), "binary_sha256": binary, "source_sha256": artstore.digest(source), "inputs": inputs,
-              "fixes": r["fixes"], "does": r["does"], "kit_commit": commit, "kit_changed": changed, "by": a.name or a.by,
+              "fixes": r["fixes"], "does": r["does"], "tool_commit": commit, "tool_changed": changed, "by": a.name or a.by,
               "time": wslib.utc(), "stamp": stamp, "warnings": notes, "log": log_id}
     summary = {k: record[k] for k in ("reproducer", "base", "result", "binary_sha256", "source_sha256", "warnings")}
+    summary["bound"] = bool(stamp.get("bound"))  # the gate counts a pass over a bound binary as not the base's own
     entry = kitlib.store_result(record, "repro", name, f"reproducer {r['name']} on {base}: {result}", a.by, "repro", summary)
     print(f"{r['name']}: {result}: {why}. Result {entry['id']}, on {base}, in {ran.seconds} s")
     return 0 if result == "pass" else 1
@@ -218,7 +239,11 @@ def gate_rows(base: str, patches: list[str]) -> list[dict]:
         hashes = {e["repro"]["binary_sha256"] for e in results if e["repro"].get("binary_sha256")}
         if len(hashes) > 1:
             notes.append(f"results on this base ran {len(hashes)} different binaries")
-        rows.append({"reproducer": name, "state": "failed" if state != "pass" else "pass", "words": f"{state}, result {last['id']}, {last['made']}",
+        bound = state == "pass" and bool(last["repro"].get("bound"))
+        words = f"{state}, result {last['id']}, {last['made']}"
+        if bound:
+            words += ": it ran over a bound binary, which isn't the base's own, so it doesn't stand for the base"
+        rows.append({"reproducer": name, "state": "bound" if bound else "failed" if state != "pass" else "pass", "words": words,
                      "warnings": notes, "result": last["id"]})
     for patch in patches:
         if patch not in covered:
@@ -237,7 +262,7 @@ def gate(a) -> int:
                 print(f"{'':<14}   warning: {note}")
         if not rows:
             print(f"nothing to list for {a.base}: no reproducers, no patches named")
-    return 1 if any(row["state"] in ("missing", "failed") for row in rows) else 0
+    return 1 if any(row["state"] in ("missing", "failed", "bound") for row in rows) else 0
 
 
 def check(a) -> int:

@@ -2,6 +2,8 @@
 """dev against a fake device: a folder, a stand-in for ssh that runs the script there with real mkdir
 and real sh, and its own clock, boot id and kernel log. Nothing here goes near a device."""
 import ast
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -34,16 +36,23 @@ class FakeDevice:
         self.env = env
         for name, text in {"clock": str(DAY_ON_THE_DEVICE), "boot_id": "boot-1", "hangchecks": "0", "renderer": "gles2",
                            "mountinfo": "20 1 0:20 / / rw - ext4 /dev/root rw\n", "settings": "@a=1\n@b=2\n", "seed": "@a=1\n@b=2\n",
-                           "commit": "abc123"}.items():
+                           "commit": "abc123", "kit_id": "kit-3"}.items():
             (self.root / name).write_text(text + ("" if text.endswith("\n") else "\n"))
         self._script(self.bin / "date", f'cat "{self.root}/clock"')
         self._script(self.root / "fake-ssh", f"""root="{self.root}"
 script=$(cat)
 printf '%s\\n----\\n' "$script" >> "$root/commands.log"
 [ -e "$root/unreachable" ] && exit 255
+# fail-when: strings, one a line. A script holding one gets ssh's own failure and doesn't run
+if [ -s "$root/fail-when" ] && printf '%s\\n' "$script" | grep -qF -f "$root/fail-when"; then exit 255; fi
+[ -e "$root/hang" ] && exec sleep 5
 cd "$root"
 export PATH="$root/bin:$PATH"
-printf '%s\\n' "$script" | sh -s""")
+printf '%s\\n' "$script" | sh -s
+code=$?
+# lose-reply: strings, one a line. The first script holding one runs, and its answer never comes back
+if [ -s "$root/lose-reply" ] && printf '%s\\n' "$script" | grep -qF -f "$root/lose-reply"; then rm -f "$root/lose-reply"; exit 255; fi
+exit $code""")
         self.config()
         env["GLASSINE_DEV_SSH"] = str(self.root / "fake-ssh")
         env["GLASSINE_DEV_STORE"] = str(self.store)
@@ -59,7 +68,7 @@ printf '%s\\n' "$script" | sh -s""")
                   "compositor": "nosuchprocess", **more}
         lines = [f"{k} = {json.dumps(v)}" for k, v in values.items()] + ["[probes]"]
         probes = {"boot_id": f"cat {r}/boot_id", "hangchecks": f"cat {r}/hangchecks", "binds": f"cat {r}/mountinfo", "renderer": f"cat {r}/renderer",
-                  "base": "echo base-7", "deployment": "echo dep-7", "boot_image": "echo boot-img", "bases": "echo base-6 base-7",
+                  "kit_id": f"cat {r}/kit_id", "base": "echo base-7", "deployment": "echo dep-7", "boot_image": "echo boot-img", "bases": "echo base-6 base-7",
                   "compositor_commit": f"cat {r}/commit", "battery_temp": "echo 300", "charging": "echo Discharging",
                   "gpu_min_clock": "echo 430000000", "open_apps": "echo foot"}
         lines += [f"{k} = {json.dumps(v)}" for k, v in probes.items()]
@@ -214,6 +223,54 @@ def test_a_signal_during_the_command_still_releases(rig):
     assert not rig.device.lock.exists()
 
 
+@pytest.mark.parametrize("with_cmd", [True, False])
+def test_a_signal_while_the_first_report_is_sent_gives_the_lock_back(rig, hub, with_cmd):
+    rig.env["GLASSINE_HUB_SECONDS"] = "10"
+    h = hub(device_report="silent")  # the report takes its time: the lock is made and CMD has not started
+    ran = rig.tmp / "ran"
+    p = subprocess.Popen([sys.executable, str(TOOLS / "dev"), "take", "--as", "a", "--purpose", "p", "--expect", "5m",
+                          *(["--", "touch", str(ran)] if with_cmd else [])], env=rig.env, cwd=rig.tmp, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + SECONDS
+    while not h.reports() and time.time() < deadline:
+        time.sleep(0.02)
+    assert h.reports(), "the report never started"
+    p.send_signal(signal.SIGTERM)
+    _, err = p.communicate(timeout=SECONDS)
+    assert p.returncode == 128 + signal.SIGTERM and "Traceback" not in err, err
+    assert not ran.exists() and not rig.device.lock.exists()
+
+
+def load_dev():
+    loader = importlib.machinery.SourceFileLoader("dev_tool", str(TOOLS / "dev"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("dev_tool", loader))
+    loader.exec_module(module)
+    return module
+
+
+def test_a_signal_as_cmd_starts_waits_for_it_and_goes_on_to_it(monkeypatch):
+    dev = load_dev()
+    real = subprocess.Popen
+
+    def popen(*args, **kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)  # arrives before CMD exists, while dev's own handler is still in place
+        return real(*args, **kwargs)
+
+    def stop(signum, _frame):
+        raise dev.Stop(signum)
+
+    signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    saved = {s: signal.signal(s, stop) for s in signals}
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    try:
+        started = time.time()
+        assert devlib.run_cmd(["sleep", "30"], after=signal.SIG_IGN) == 128 + signal.SIGTERM
+        assert time.time() - started < 10
+        assert all(signal.getsignal(s) == signal.SIG_IGN for s in signals)  # CMD is over: no handler can land before the release
+    finally:
+        for s, handler in saved.items():
+            signal.signal(s, handler)
+
+
 def test_a_device_gone_after_the_command_leaves_the_lock_and_says_so(rig):
     done = rig.take("a", cmd=["touch", rig.device.root / "unreachable"], code=1)
     assert "dev release --as a" in done.stderr
@@ -225,6 +282,75 @@ def test_a_reboot_in_the_command_gets_a_while_before_the_release(rig):
     gone = rig.device.root / "unreachable"
     rig.take("a", cmd=["sh", "-c", f'touch "{gone}"; (sleep 1; rm "{gone}") >/dev/null 2>&1 &'])
     assert not rig.device.lock.exists()
+
+
+def test_a_device_that_hangs_after_the_command_is_tried_again(rig):
+    d = rig.device
+    d.config(release_tries=5, release_gap_seconds=1, ssh_seconds=1)
+    hang = d.root / "hang"
+    done = rig.take("a", cmd=["sh", "-c", f'touch "{hang}"; (sleep 2; rm "{hang}") >/dev/null 2>&1 &'])
+    assert "didn't answer" in done.stderr and not d.lock.exists()  # a timeout is a try used up, not the end of them
+
+
+def test_a_release_whose_reply_was_lost_is_not_a_failure(rig):
+    d = rig.device
+    d.config(release_tries=3)
+    (d.root / "lose-reply").write_text("mkdir -p history.d\n")  # the release lands, its answer doesn't
+    done = rig.take("a", cmd=["true"])
+    assert not (d.root / "lose-reply").exists(), "the fault never fired"
+    assert "may still be held" not in done.stderr and not d.lock.exists()
+
+
+def left_under_a_dead_take(rig):
+    """The device went away as CMD ended: the release failed and the lock stays, with its `running`."""
+    d = rig.device
+    rig.take("a", cmd=["touch", d.root / "unreachable"], code=1)
+    (d.root / "unreachable").unlink()
+    assert (d.lock / "running").exists()
+
+
+def test_a_lock_left_under_a_take_that_has_ended_is_released_by_its_name(rig):
+    left_under_a_dead_take(rig)
+    assert "has ended" in rig.dev("release", "--as", "a").stderr
+    assert not rig.device.lock.exists()
+
+
+def test_a_join_under_a_lock_whose_take_has_ended_says_so(rig):
+    left_under_a_dead_take(rig)
+    done = rig.take("a", cmd=["true"])
+    assert "has ended" in done.stderr and "dev release --as a" in done.stderr
+    assert rig.device.lock.exists()  # a join never releases
+
+
+@pytest.mark.parametrize("change,released", [
+    ({}, False),                         # the take is alive: a release inside its CMD
+    ({"host": "elsewhere"}, False),      # another host: this one can't see its processes
+    ({"ns": "pid:[1]"}, False),          # another pid namespace: the same
+    ({"start": "1"}, True),              # the pid is somebody else's now
+    ({"pid": "none"}, False),            # a record it can't read
+])
+def test_running_is_trusted_only_where_this_host_can_see_the_take_end(rig, change, released):
+    rig.take("a")
+    fields = devlib.parse_fields(devlib.take_record(os.getpid())) | change  # a live process: this test's own
+    (rig.device.lock / "running").write_text("".join(f"{k}: {v}\n" for k, v in fields.items()))
+    rig.dev("release", "--as", "a", code=0 if released else 1)
+    assert rig.device.lock.exists() != released
+
+
+def test_a_pid_that_is_gone_is_a_take_that_has_ended(rig):
+    rig.take("a")
+    child = subprocess.Popen(["true"])
+    fields = devlib.parse_fields(devlib.take_record(child.pid))
+    child.wait()
+    (rig.device.lock / "running").write_text("".join(f"{k}: {v}\n" for k, v in fields.items()))
+    rig.dev("release", "--as", "a")
+    assert not rig.device.lock.exists()
+
+
+def test_an_old_empty_running_file_still_refuses_a_release(rig):
+    rig.take("a")
+    (rig.device.lock / "running").write_text("")
+    assert "running command" in rig.dev("release", "--as", "a", code=1).stderr
 
 
 def test_by_hand_mkdir_blocks_and_status_says_owner_not_written(rig):
@@ -447,6 +573,12 @@ def test_no_script_ever_names_run_even_with_a_real_fifo_there(rig):
     run_everything(rig)  # each run is bounded: a read of the FIFO would fail on the timeout
     for script in rig.device.log.read_text().split("\n----\n"):
         assert not re.search(r"(^|[\s'\"=:(])(/var)?/run\b", script), script
+        assert not devlib.touches_run(script), script  # the config's own test too, so the two can't drift apart
+
+
+def test_the_default_probes_never_name_run():
+    # the fake device's dev.toml overrides some of them, so the scan of its scripts never sees these
+    assert not any(devlib.touches_run(command) for command in devlib.DEFAULT_PROBES.values()), devlib.DEFAULT_PROBES
 
 
 def test_a_fifo_in_the_store_doesnt_block_a_read(rig):
@@ -629,6 +761,36 @@ def test_a_refused_take_spends_nothing(rig, hub):
     assert not [r for r in h.seen if r["op"] == "decision.use"] and not rig.device.lock.exists()
 
 
+def spends(h):
+    return [r for r in h.seen if r["op"] == "decision.use"]
+
+
+def test_a_write_that_fails_after_the_checks_spends_no_run(rig, hub):
+    h = hub(decision_use=HUB_YES)
+    (rig.device.root / "fail-when").write_text("> lock.d/check\n")  # the take's record on the device can't be written
+    done = rig.take("a", "--does", "reboot", "--go", "7", code=1)
+    assert "can't reach the device" in done.stderr
+    assert not spends(h) and not rig.device.lock.exists()
+
+
+def test_a_no_from_the_hub_leaves_the_queue_the_records_and_the_base_alone(rig, hub):
+    hub(decision_use=HUB_NO)
+    d = rig.device
+    rig.dev("wait", "--as", "a", "--on", "x", "--until", "1h")
+    d.override("old", owner="z", boot_id="boot-0", target="/usr/x")  # a dead record: a take that gets through clears it
+    rig.take("a", "--does", "suspend", "--go", "7", code=1)
+    assert len(d.queue()) == 1 and (d.store / "overrides.d" / "old").exists() and not (d.store / "hangcheck-base").exists()
+    assert not d.lock.exists()
+
+
+def test_a_clean_up_that_fails_after_the_hubs_yes_doesnt_refuse_the_take(rig, hub):
+    h = hub(decision_use=HUB_YES)
+    (rig.device.root / "fail-when").write_text("> hangcheck-base\n")
+    ran = rig.tmp / "ran"
+    done = rig.take("a", "--does", "reboot", "--go", "7", cmd=["touch", ran])
+    assert ran.exists() and "clean-up" in done.stderr and len(spends(h)) == 1
+
+
 def test_a_go_the_hub_says_no_to_gives_the_lock_back(rig, hub):
     hub(decision_use=HUB_NO)
     assert "doesn't cover suspend" in rig.take("a", "--does", "suspend", "--go", "7", code=1).stderr
@@ -687,8 +849,22 @@ def test_the_hub_is_asked_after_the_device_check_so_a_dirty_device_spends_no_go(
     assert not [r for r in h.seen if r["op"].startswith("decision")]
 
 
+def test_a_join_with_new_actions_spends_a_run_and_actions_already_on_the_lock_dont(rig, hub):
+    h = hub(decision_use=HUB_YES)
+    rig.take("a")  # no actions, so nothing asked and nothing spent
+    for _ in range(3):
+        rig.dev("take", "--as", "a", "--purpose", "step", "--does", "reboot", "--go", "7", "--", "true")
+    asked = [r["op"] for r in h.seen if r["op"].startswith("decision")]
+    assert asked == ["decision.holding", "decision.use"]  # the lock now covers reboot: once
+    rig.dev("take", "--as", "a", "--purpose", "step", "--does", "suspend", "--go", "7", "--", "true")
+    [first, second] = spends(h)
+    assert (first["actions"], second["actions"], second["id"], second["agent_token"]) == (["reboot"], ["suspend"], "7", "tool-token")
+    assert not [r for r in h.seen if r["op"] == "decision.check"]
+    assert rig.device.field("does") == "reboot,suspend"
+
+
 def test_a_join_with_new_actions_goes_through_the_table_keeping_the_lock(rig, hub):
-    hub(decision_check=HUB_NO)
+    hub(decision_use=HUB_NO)
     rig.take("a", "--does", "reboot", "--go-said", "reboot it")
     made = rig.device.field("made")
     assert "name a go" in rig.dev("take", "--as", "a", "--purpose", "more", "--does", "suspend", code=1).stderr
@@ -706,7 +882,7 @@ def test_a_report_goes_before_and_after_the_command_and_is_the_whole_state(rig, 
     rig.take("a", cmd=["true"])
     held, free = h.reports()
     assert held["lock"]["owner"] == "a" and free["lock"] is None
-    assert (held["device"], held["base"], held["deployment"], held["boot_image"], held["renderer"]) == ("note-air-1", "base-7", "dep-7", "boot-img", "gles2")
+    assert (held["device"], held["base"], held["deployment"], held["boot_image"], held["renderer"]) == ("device", "base-7", "dep-7", "boot-img", "gles2")
     assert held["bases"] == ["base-6", "base-7"] and held["free_kb"] > 0 and held["overrides"] == {} and held["queue"] == []
     assert held["device_time"] == DAY_ON_THE_DEVICE
     assert "made" not in held["lock"]
@@ -772,7 +948,7 @@ def test_stamp_has_the_fields_and_says_what_it_doesnt_know(rig):
     d.override("tune", owner="a", boot_id="boot-1", setting="@x", value="9")
     d.set("settings", "@a=1\n@b=2\n@x=9")
     out = json.loads(rig.dev("stamp", "--json").stdout)
-    assert out["base"] == "base-7" and out["boot_image"] == "boot-img" and out["renderer"] == "gles2"
+    assert out["kit_id"] == "kit-3" and out["base"] == "base-7" and out["boot_image"] == "boot-img" and out["renderer"] == "gles2"
     assert out["compositor_commit"] == "abc123" and out["fallback_flag"] == "clear" and out["charging"] == "Discharging"
     assert out["open_apps"] == "foot" and out["gpu_min_clock"] == "430000000" and out["battery_temp"] == "300"
     assert out["live_settings"] == {"tune": "9 (recorded, unconfirmed)"}
@@ -829,6 +1005,33 @@ def test_free_text_is_one_capped_line(rig):
     assert "\n" not in purpose and len(purpose) == devlib.TEXT_CAP
 
 
+@pytest.mark.parametrize("text", ["@@dev:file lock.d/owner", "@@dev:file lock.d/made", "@@dev:locked", "@@dev:rc 0",
+                                  "@@dev:probe renderer", "@@dev:now 5"])
+def test_free_text_that_looks_like_a_read_marker_stays_text(rig, text):
+    rig.dev("take", "--as", "a", "--purpose", text, "--expect", "5m")
+    lock = json.loads(rig.dev("status", "--json").stdout)
+    assert (lock["lock"]["owner"], lock["lock"]["purpose"], lock["device_time"]) == ("a", text, DAY_ON_THE_DEVICE)
+    rig.dev("release", "--as", "a")
+    assert not rig.device.lock.exists()
+
+
+def test_a_marker_in_a_file_written_by_hand_or_in_a_probes_output_is_text(rig):
+    rig.take("a")
+    (rig.device.lock / "notice").write_text("@@dev:file lock.d/owner\n@@dev:rc 0\n")
+    rig.device.set("renderer", "@@dev:file lock.d/owner")
+    out = json.loads(rig.dev("status", "--json").stdout)
+    assert out["lock"]["owner"] == "a" and out["renderer"] == "@@dev:file lock.d/owner"
+    assert "@@dev:rc 0" in rig.dev("status").stdout
+
+
+def test_a_go_id_is_one_capped_line_in_the_record(rig, hub):
+    hub(decision_use=HUB_YES)
+    rig.take("a", "--does", "reboot", "--go", "7\n@@dev:file lock.d/owner " + "x" * 300)
+    go = rig.device.field("go")
+    assert "\n" not in go and len(go) <= devlib.TEXT_CAP
+    assert "Held by a" in rig.dev("status").stdout
+
+
 def test_awkward_text_stays_data_on_the_device(rig):
     nasty = """$(touch pwned) `touch pwned` ';touch pwned;' "x" """
     rig.dev("take", "--as", "a", "--purpose", nasty, "--expect", "5m", "--dirty", nasty)
@@ -853,3 +1056,15 @@ def test_history_is_kept_short(rig):
     rig.take("a", cmd=["true"])
     names = sorted(p.name for p in h.iterdir())
     assert len(names) == devlib.HISTORY_KEPT and "released" in names[-1] and names[0].startswith("0000000006")
+
+
+def test_without_an_ssh_command_nothing_runs_and_it_says_where_to_set_one(rig):
+    rig.env.pop("GLASSINE_DEV_SSH")
+    err = rig.dev("status", code=1).stderr
+    assert "GLASSINE_DEV_SSH" in err and "dev.toml" in err
+    assert not rig.device.log.exists()
+
+
+def test_the_device_name_comes_from_the_config(rig):
+    rig.device.config(name="bench-1")
+    assert json.loads(rig.dev("status", "--json").stdout)["device"] == "bench-1"

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """The dump here is written by hand in the format's shape. No real dump is ever a test input in this repository."""
+import hashlib
 import json
 import os
 import stat
@@ -8,6 +9,10 @@ from pathlib import Path
 import pytest
 
 TIME = 1800000000.5
+# Written from the kernel's format strings, not captured on a device.
+PREEMPT_LINE = "a5xx: hang detect: hw rb {hw} (CP_RB_BASE 1000), cur rb {cur}, next rb {next}, preempt state {state}\n"
+BLAME_LINE = "a5xx: hw is on rb {ring}, not rb {cur}: blaming rb {ring}\n"
+FAULT_LINE = "gpu fault ring {ring} fence 1a status 00000000 rb 0010/0020 ib1 0000000000001000/0020 ib2 0000000000002000/0010\n"
 
 
 def dump_text(rbbm="0x12345678", ib1=0x20, ib2=0x10, comm="app", kernel="7.0-test", time=TIME, revision="509 (05000900)"):
@@ -60,7 +65,8 @@ def fake_decoder(ws, mesa="26.0", *more):
 
 
 def test_add_stores_a_fault_with_what_the_dump_says_and_what_it_cant(ws):
-    id_ = add(ws, "--log", ws.file("dmesg", "hw rb 2, cur rb 2, next rb 0, preempt state 3\n"))
+    log = PREEMPT_LINE.format(hw=2, cur=2, next=-1, state=3) + FAULT_LINE.format(ring=2)
+    id_ = add(ws, "--log", ws.file("dmesg", log))
     e = record(ws, id_)
     d = e["dump"]
     assert (d["kernel"], d["app"], d["time"], d["time_from"]) == ("7.0-test", "app", TIME, "dump")
@@ -71,6 +77,112 @@ def test_add_stores_a_fault_with_what_the_dump_says_and_what_it_cant(ws):
     assert Path(ws.art("path", id_).stdout.strip()).is_relative_to(ws.artifacts / "dumps")
     assert (ws.tmp / "dmesg").exists()  # the log may cover a second dump of the event
     assert ws.art("path", d["log"]).stdout
+
+
+def logged(ws, text):
+    return record(ws, add(ws, "--log", ws.file("dmesg", text)))["dump"]
+
+
+def test_a_preempt_line_with_no_next_ring_still_gives_the_preempt_state(ws):
+    d = logged(ws, PREEMPT_LINE.format(hw=1, cur=-1, next=-1, state=2))
+    assert d["preempt_state"] == 2 and "ring" not in d
+
+
+def test_the_ring_is_the_one_the_kernel_blames_not_cur_rb(ws):
+    d = logged(ws, PREEMPT_LINE.format(hw=1, cur=0, next=1, state=2) + BLAME_LINE.format(ring=1, cur=0) + FAULT_LINE.format(ring=1))
+    assert (d["ring"], d["preempt_state"]) == (1, 2)
+
+
+def test_a_lockup_names_the_ring(ws):
+    assert logged(ws, "a5xx: hangcheck detected gpu lockup rb 3!\n")["ring"] == 3
+
+
+def test_a_ring_of_minus_one_is_unknown(ws):
+    d = logged(ws, FAULT_LINE.format(ring=-1))
+    assert "ring" not in d
+    assert "ring=unknown" in ws.tool("dumps", "group").stdout
+
+
+def test_a_log_with_two_faults_leaves_what_they_disagree_on_unknown_and_says_so(ws):
+    log = ws.file("dmesg", PREEMPT_LINE.format(hw=0, cur=0, next=-1, state=1) + FAULT_LINE.format(ring=0)
+                  + PREEMPT_LINE.format(hw=2, cur=2, next=-1, state=3) + FAULT_LINE.format(ring=2))
+    done = ws.tool("dumps", "add", write_dump(ws), "--mesa", "26.0", "--profile", "short", "--ran", "x", "--log", log)
+    d = record(ws, done.stdout.strip())["dump"]
+    assert "ring" not in d and "preempt_state" not in d
+    assert "more than one ring (0, 2)" in done.stderr and "--ring says which" in done.stderr
+    assert "more than one preempt_state (1, 3)" in done.stderr and "--preempt-state says which" in done.stderr
+
+
+def test_a_lockup_and_a_later_fault_on_another_ring_dont_mix(ws):
+    d = logged(ws, "a5xx: hangcheck detected gpu lockup rb 1!\n" + PREEMPT_LINE.format(hw=2, cur=2, next=0, state=3) + FAULT_LINE.format(ring=2))
+    assert "ring" not in d and d["preempt_state"] == 3
+
+
+def test_a_value_repeated_in_a_log_is_one_value(ws):
+    line = PREEMPT_LINE.format(hw=2, cur=2, next=-1, state=3)
+    d = logged(ws, line + FAULT_LINE.format(ring=2) + line)
+    assert (d["ring"], d["preempt_state"]) == (2, 3)
+
+
+def test_a_flag_settles_what_a_log_disagrees_on(ws):
+    log = ws.file("dmesg", FAULT_LINE.format(ring=0) + FAULT_LINE.format(ring=2))
+    done = ws.tool("dumps", "add", write_dump(ws), "--mesa", "26.0", "--profile", "short", "--ran", "x", "--log", log, "--ring", "2")
+    assert record(ws, done.stdout.strip())["dump"]["ring"] == 2 and "more than one ring" not in done.stderr
+
+
+def log_entries(ws):
+    path = ws.artifacts / "dumps" / "manifest.jsonl"
+    entries = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return [e for e in entries if e["dump"]["kind"] == "gpu-log"]
+
+
+def test_a_symlinked_dump_is_refused_and_stores_no_log(ws):
+    link = ws.tmp / "link"
+    link.symlink_to(write_dump(ws))
+    ws.tool("dumps", "add", link, "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), code=1)
+    assert log_entries(ws) == [] and link.is_symlink()
+
+
+def test_a_dump_in_the_build_cache_in_place_is_refused_and_stores_no_log(ws):
+    cache = ws.user_home / ".cache" / "glassine"
+    cache.mkdir(parents=True)
+    dump = cache / "devcd"
+    dump.write_text(dump_text())
+    ws.tool("dumps", "add", dump, "--in-place", "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), code=1)
+    assert log_entries(ws) == [] and dump.exists()
+
+
+@pytest.mark.parametrize("bad", [["--keep", "soon"], ["--time", "whenever"], ["--event-with", "nope"]])
+def test_a_bad_flag_stores_neither_the_log_nor_the_dump(ws, bad):
+    dump = write_dump(ws)
+    ws.tool("dumps", "add", dump, "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), *bad, code=1)
+    assert log_entries(ws) == [] and dump.exists()
+
+
+def test_adding_a_dump_again_stores_no_log_applies_no_flag_and_says_so(ws):
+    first = add(ws, "--ring", "1")
+    before = manifest(ws)
+    done = ws.tool("dumps", "add", write_dump(ws), "--mesa", "26.0", "--profile", "p", "--ran", "x", "--log", ws.file("dmesg", "x\n"), "--ring", "9")
+    assert done.stdout.startswith(f"{first}: already stored") and "--log and the flags weren't applied" in done.stdout
+    assert manifest(ws) == before and (ws.tmp / "devcd").exists()
+
+
+def test_two_dumps_can_share_a_log(ws):
+    log = ws.file("dmesg", FAULT_LINE.format(ring=2))
+    a = add(ws, "--log", log)
+    b = add(ws, "--log", log, rbbm="0x1", time=TIME + 1000)
+    assert record(ws, a)["dump"]["log"] == record(ws, b)["dump"]["log"] and len(log_entries(ws)) == 1
+
+
+def test_a_dump_and_its_log_with_a_date_can_both_go_after_it_dump_first(ws):
+    id_ = add(ws, "--keep", "2000-01-01", "--log", ws.file("dmesg", "x\n"))
+    e = record(ws, id_)
+    log = e["dump"]["log"]
+    expired = ws.art("find", "--expired").stdout
+    assert e["name"] in expired and log in expired
+    assert "referenced by artifact " + e["name"] in ws.art("rm", log, "--why", "x", code=1).stderr
+    ws.art("rm", e["name"], "--why", "its date passed")
+    ws.art("rm", log, "--why", "its date passed")
 
 
 def test_mesa_profile_and_what_ran_are_required(ws):
@@ -95,6 +207,29 @@ def test_a_file_that_isnt_a_dump_is_stored_with_unknowns_and_says_so(ws):
     assert "rbbm_status" in done.stderr
     d = record(ws, done.stdout.strip())["dump"]
     assert d["time_from"] == "file date"
+
+
+@pytest.mark.parametrize("rbbm", ["garbage", "", "-1", "0x", "1_000"])
+def test_a_bad_rbbm_status_stays_unknown(ws, rbbm):
+    assert "rbbm_status" not in record(ws, add(ws, rbbm=rbbm))["dump"]
+
+
+@pytest.mark.parametrize("time", ["nan", "inf", "-inf", "1e30", "garbage", ""])
+def test_a_bad_time_in_a_dump_stays_unknown(ws, time):
+    d = record(ws, add(ws, "--log", ws.file("dmesg", "x\n"), time=time))["dump"]
+    assert d["time_from"] == "file date"
+
+
+def test_a_header_with_no_value_stays_unknown(ws):
+    d = record(ws, add(ws, kernel="", comm=""))["dump"]
+    assert "kernel" not in d and "app" not in d
+
+
+@pytest.mark.parametrize("time", ["nan", "inf", "1e30", "whenever"])
+def test_a_bad_time_given_by_hand_is_refused_and_moves_nothing(ws, time):
+    dump = write_dump(ws)
+    err = ws.tool("dumps", "add", dump, "--mesa", "26.0", "--profile", "p", "--ran", "x", "--time", time, code=1).stderr
+    assert f"not a time: {time}" in err and "Traceback" not in err and dump.exists()
 
 
 def test_other_gpu_families_leave_the_registers_unknown(ws):
@@ -148,8 +283,23 @@ def test_an_image_decoder_runs_in_a_container_with_no_network_and_read_only_moun
     id_ = add(ws)
     fake_decoder(ws, "26.0", "--image", "alpine:test")
     out = ws.tool("dumps", "show", id_).stdout
-    assert "--network none" in out and ":/dump:ro" in out and ":/usr/local/bin/crashdec:ro" in out
+    assert "--network none" in out and "--log-driver none" in out and f"--user {os.getuid()}:{os.getgid()}" in out
+    assert "target=/dump,readonly" in out and "target=/usr/local/bin/crashdec,readonly" in out
     assert "alpine:test crashdec -f /dump" in out
+
+
+def test_a_path_with_a_colon_comma_or_space_stays_one_mount_value(ws, monkeypatch):
+    bin_dir = ws.tmp / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text('#!/bin/sh\nfor arg; do echo "[$arg]"; done\n')
+    docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    dump = write_dump(ws, "x:y z,w")
+    done = ws.tool("dumps", "add", dump, "--in-place", "--mesa", "26.0", "--profile", "p", "--ran", "x")
+    fake_decoder(ws, "26.0", "--image", "alpine:test")
+    out = ws.tool("dumps", "show", done.stdout.strip()).stdout
+    assert f'[type=bind,"source={dump}",target=/dump,readonly]' in out
 
 
 def test_group_fingerprints_and_keeps_ib2_and_shader_hash_out_of_it(ws):
@@ -177,6 +327,53 @@ def test_dumps_close_in_time_are_one_event_and_a_link_can_be_named(ws):
     assert event(first) == first and event(second) == first
     assert event(far) == far and event(named) == far and event(other_kernel) == other_kernel
     assert f"event {first}" in ws.tool("dumps", "group").stdout
+
+
+def no_kernel_dump(ws, name, *more):
+    path = ws.file(name, f"time: {TIME}\ncomm: {name}\n")
+    return ws.tool("dumps", "add", path, "--mesa", "26.0", "--profile", "p", "--ran", name, *more).stdout.split("\n")[0]
+
+
+def event_of(ws, id_):
+    return record(ws, id_)["dump"]["event"]
+
+
+def test_dumps_with_no_kernel_arent_linked_by_time(ws):
+    a, b = no_kernel_dump(ws, "devA"), no_kernel_dump(ws, "devB")
+    assert event_of(ws, a) == a and event_of(ws, b) == b
+
+
+def test_a_dump_with_a_kernel_isnt_linked_to_one_without(ws):
+    a = no_kernel_dump(ws, "devA")
+    b = add(ws)
+    assert event_of(ws, b) == b != a
+
+
+def test_a_given_kernel_counts_as_known(ws):
+    a = no_kernel_dump(ws, "devA", "--kernel", "7.0-test")
+    b = no_kernel_dump(ws, "devB", "--kernel", "7.0-test")
+    assert event_of(ws, b) == a
+
+
+def test_an_event_doesnt_chain_past_the_window(ws):
+    first = add(ws, name="a")
+    second = add(ws, name="b", time=TIME + 25)
+    third = add(ws, name="c", time=TIME + 50)
+    assert event_of(ws, second) == first and event_of(ws, third) == third
+
+
+def test_an_event_doesnt_stretch_past_the_window_when_added_out_of_order(ws):
+    middle = add(ws, name="a", time=TIME + 25)
+    early = add(ws, name="b")
+    late = add(ws, name="c", time=TIME + 50)
+    assert event_of(ws, early) == middle and event_of(ws, late) == late
+
+
+def test_a_dump_between_two_events_joins_the_nearer_one(ws):
+    far = add(ws, name="a")
+    near = add(ws, name="b", time=TIME + 31)
+    between = add(ws, name="c", time=TIME + 20)
+    assert event_of(ws, near) == near and event_of(ws, between) == near != far
 
 
 def test_event_with_must_be_a_gpu_dump(ws):
@@ -248,6 +445,83 @@ def test_a_ram_dump_with_a_bad_image_name_moves_nothing(ws):
     image, klog = ws.file("bad name"), ws.file("klog", "x")
     ws.tool("dumps", "add-ram", image, "--build", "kernel-build", "--kernel-log", klog, "--until", "2999-01-01", "--ran", "x", code=1)
     assert image.exists() and klog.exists()
+
+
+def add_ram(ws, *more, until="2999-01-01", build="kernel-build", image="DDRCS0_0.BIN", log="Booting Linux\n", code=0):
+    return ws.tool("dumps", "add-ram", ws.file(image, f"raw {image}\n"), "--build", build, "--kernel-log", ws.file("klog", log),
+                   "--until", until, "--ran", "froze overnight", *more, code=code)
+
+
+def test_adding_a_ram_dump_again_with_the_same_date_and_build_changes_nothing_and_says_so(ws):
+    ws.add("kernel-build", keep="always")
+    add_ram(ws)
+    before = manifest(ws)
+    out = add_ram(ws).stdout
+    assert out.count("already stored") == 2 and "kept until 2999-01-01" in out
+    assert manifest(ws) == before and (ws.tmp / "DDRCS0_0.BIN").exists() and (ws.tmp / "klog").exists()
+
+
+@pytest.mark.parametrize("change", [{"until": "2000-01-01"}, {"build": "other-build"}, {"log": "another log\n"}])
+def test_adding_a_ram_image_again_with_another_date_build_or_log_is_refused(ws, change):
+    ws.add("kernel-build", keep="always")
+    ws.add("other-build", keep="always")
+    add_ram(ws)
+    before = manifest(ws)
+    err = add_ram(ws, **change, code=1).stderr
+    assert "already stored" in err and "kernel-build" in err and "nothing was changed" in err
+    assert manifest(ws) == before and (ws.tmp / "DDRCS0_0.BIN").exists() and (ws.tmp / "klog").exists()
+
+
+def test_a_ram_log_stored_with_another_build_is_refused_for_a_new_image(ws):
+    ws.add("kernel-build", keep="always")
+    ws.add("other-build", keep="always")
+    add_ram(ws)
+    before = manifest(ws)
+    err = add_ram(ws, build="other-build", image="DDRCS1_0.BIN", code=1).stderr
+    assert "already stored with build kernel-build" in err
+    assert manifest(ws) == before and (ws.tmp / "DDRCS1_0.BIN").exists()
+
+
+def test_a_second_image_can_join_a_stored_ram_log(ws):
+    ws.add("kernel-build", keep="always")
+    add_ram(ws)
+    add_ram(ws, image="DDRCS1_0.BIN")
+    assert sorted(e["dump"]["kind"] for e in manifest(ws)) == ["ram", "ram", "ram-log"]
+
+
+def test_a_kernel_log_can_have_any_name(ws):
+    ws.add("kernel-build")
+    ws.tool("dumps", "add-ram", ws.file("J.BIN"), "--build", "kernel-build", "--kernel-log", ws.file("dmesg (1).txt", "x"),
+            "--until", "2999-01-01", "--ran", "x")
+    assert not (ws.tmp / "dmesg (1).txt").exists()
+
+
+def test_a_file_named_twice_moves_nothing(ws):
+    ws.add("kernel-build")
+    image, klog = ws.file("J.BIN"), ws.file("klog", "x")
+    for images, log in (([image, image], klog), ([image, klog], klog)):
+        ws.tool("dumps", "add-ram", *images, "--build", "kernel-build", "--kernel-log", log, "--until", "2999-01-01", "--ran", "x", code=1)
+        assert image.exists() and klog.exists()
+    assert not (ws.artifacts / "dumps" / "manifest.jsonl").exists()
+
+
+def test_a_ram_dump_that_stops_partway_says_what_went_in_and_can_be_finished(ws):
+    ws.add("kernel-build", keep="always")
+    first, second = ws.file("A.BIN", "raw a\n"), ws.file("B.BIN", "raw b\n")
+    klog = ws.file("klog", "Booting Linux\n")
+    args = ("--build", "kernel-build", "--until", "2999-01-01", "--ran", "x")
+    sha = hashlib.sha256(b"raw b\n").hexdigest()[:12]
+    in_the_way = ws.artifacts / "dumps" / f"{sha}-ram-{sha}-B.BIN"  # the move onto a folder fails, as a full disk would
+    in_the_way.mkdir(parents=True)
+    err = ws.tool("dumps", "add-ram", first, second, "--kernel-log", klog, *args, code=1).stderr
+    log = next(e for e in manifest(ws) if e["dump"]["kind"] == "ram-log")
+    image = next(e for e in manifest(ws) if e["dump"]["kind"] == "ram")
+    assert f"stopped at {second}" in err and log["name"] in err and image["name"] in err
+    assert second.exists() and not first.exists() and not klog.exists()
+    in_the_way.rmdir()
+    ws.tool("dumps", "add-ram", second, "--kernel-log", ws.art("path", log["name"]).stdout.strip(), *args)
+    assert sorted(e["dump"]["kind"] for e in manifest(ws)) == ["ram", "ram", "ram-log"]
+    assert not second.exists()
 
 
 def test_a_stored_dump_is_read_only_and_the_folder_private(ws):

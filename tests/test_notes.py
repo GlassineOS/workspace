@@ -384,7 +384,7 @@ def test_a_note_in_the_wrong_place_is_a_problem(nb):
     assert "AREA/TOPIC" in nb.run("lint", code=1).stdout
 
 
-# Replacing, retracting, closing: nothing is deleted
+# Replacing, retracting, closing: the text stays, in Log
 
 
 def test_replace_stays_in_place_and_keeps_the_old_words_in_the_log(nb):
@@ -550,6 +550,57 @@ def test_hand_wrapped_claims_are_moved_whole(nb):
     nb.set("--retract", "c1", "--by", "c2", "--why", "x")
     assert f"- c1 [user] first line second line RETRACTED {TODAY} by c2: x\n" in nb.section("Log")
     assert nb.section("Current") == "- c2 [user] other\n"
+
+
+# Deleting: the text goes, its id and why stay in Log
+
+
+def test_a_delete_takes_the_text_out_and_what_rests_on_it_out_of_current(nb):
+    nb.seen("Base")
+    nb.set("Direct", "--inferred", "c1")
+    nb.seen("Shows it wrong")
+    done = nb.set("--delete", "c1", "--by", "c3", "--why", "contradicted by the bench")
+    assert "a/t c1 deleted" in done.stdout and "out of Current with it: c2" in done.stdout
+    assert "Base" not in nb.text()
+    assert nb.section("Current") == f"- c3 [seen: {EVIDENCE}] Shows it wrong\n"
+    log = nb.section("Log")
+    assert f"- c1 DELETED {TODAY} by c3: contradicted by the bench\n" in log
+    assert f"- c2 [inferred: c1] Direct OUT {TODAY}: rested on c1.\n" in log
+    nb.run("lint")
+    assert "Base" in nb.git("log", "-p")  # the notes' own history keeps the text
+
+
+def test_the_maintainer_deletes_without_a_witness_and_the_id_never_comes_back(nb):
+    nb.seen("One")
+    nb.seen("Two")
+    nb.set("--delete", "c2", "--why", "wrong")
+    assert nb.seen("Three") == "c3"
+    nb.run("lint")
+
+
+@pytest.mark.parametrize("args, words", [
+    (("--delete", "c1"), "needs --why"),
+    (("--delete", "c9", "--why", "x"), "no claim c9"),
+    (("--delete", "c1", "--by", "c1", "--why", "x"), "can't show itself wrong"),
+    (("--delete", "c1", "--by", "c2", "--why", "x"), "rests on c1"),
+    (("--delete", "c1", "--retract", "c1", "--why", "x"), "one at a time"),
+    (("--delete", "c1", "words", "--why", "x"), "would be dropped"),
+])
+def test_delete_refuses(nb, args, words):
+    nb.seen("Fact")
+    nb.set("Rests", "--inferred", "c1")
+    before = nb.text()
+    assert words in nb.set(*args, code=1).stderr
+    assert nb.text() == before
+
+
+def test_a_deleted_claim_cant_be_touched_again_nor_faked(nb):
+    nb.seen("Fact")
+    nb.seen("Other")
+    nb.set("--delete", "c1", "--why", "wrong")
+    assert "c1 was deleted" in nb.set("--delete", "c1", "--why", "again", code=1).stderr
+    assert "c1 was deleted" in nb.set("--retract", "c2", "--by", "c1", "--why", "x", code=1).stderr
+    assert "shape of a mark" in nb.add(f"c2 DELETED {TODAY}: gone", code=1).stderr
 
 
 # The scan

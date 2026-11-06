@@ -27,6 +27,10 @@ _ID = re.compile(r"c[0-9]+")
 # or a date and an id in other words, is text, and add and set refuse words that fake a mark.
 _REPLACED = re.compile(r"(?<!\S)REPLACED [0-9]{4}-[0-9]{2}-[0-9]{2} by (c[0-9]+)\.(?=\s|$)")
 _RETRACTED = re.compile(r"(?<!\S)RETRACTED ([0-9]{4}-[0-9]{2}-[0-9]{2}) by (c[0-9]+): ")
+# What's left of a deleted claim: its id, the date, what showed it wrong if anything, and why. Only this line,
+# in Log, keeps the id taken, so it never comes back for another claim.
+_DELETED = re.compile(r"(c[0-9]+) DELETED ([0-9]{4}-[0-9]{2}-[0-9]{2})(?: by (c[0-9]+))?: (?=\S)")
+_DELETED_MARK = re.compile(r"(?<!\S)DELETED [0-9]{4}-[0-9]{2}-[0-9]{2}(?: by c[0-9]+)?: ")
 # The org scan checks only the first address-shaped line of a file, so an allowed one hides the
 # rest, and it passes an address that touches a colon (addr:AA:..., AA:...: up) or uses dashes. Until
 # that's fixed there (GlassineOS/.github#3 covers part of it), _flagged_addresses checks every address
@@ -52,6 +56,7 @@ class Item:
     value: str = ""
     text: str = ""
     retracted_by: str | None = None
+    deleted: bool = False
 
     @property
     def tag(self) -> str:
@@ -93,6 +98,11 @@ def _read_claim(item: Item, problem) -> None:
     words = item.words
     if not words:
         problem("a bullet with nothing in it")
+        return
+    if _DELETED.match(words):
+        item.id, item.deleted, item.text = words.split(" ", 1)[0], True, words
+        if item.section != "Log":
+            problem(f"what's left of a deleted claim belongs in Log: {item.id}")
         return
     if m := re.match(r"(c[0-9]+)\s+", words):
         # "c5 is broken" in Log is a plain line: an id is one only with provenance after it, or outside Log
@@ -250,7 +260,7 @@ def lint(text: str, only: set[str] | None = None) -> list[tuple[int, str]]:
 
 
 def next_id(doc: Doc) -> str:
-    """Ids are per topic and never come back, since nothing is deleted."""
+    """Ids are per topic and never come back: a deleted claim leaves a line with its id in Log."""
     used = [int(m.group(1)) for line in doc.lines if (m := re.match(r"- c([0-9]+)\b", line))]
     return f"c{max(used, default=0) + 1}"
 
@@ -315,9 +325,9 @@ def _take_out(lines: list[str], dependents: list[str], root: str) -> None:
 
 def _no_marks(words: str) -> str:
     """Words that fake what the tool writes would be read as it: refuse them, so a mark only comes from here."""
-    if _RETRACTED.search(words + " ") or _REPLACED.search(words + " "):
-        raise ToolError("these words have the shape of a mark the tool writes (RETRACTED or REPLACED, a date, "
-                        "by cN): say it another way, and use notes set --retract to retract")
+    if _RETRACTED.search(words + " ") or _REPLACED.search(words + " ") or _DELETED_MARK.search(words + " "):
+        raise ToolError("these words have the shape of a mark the tool writes (RETRACTED, REPLACED or DELETED, a "
+                        "date, by cN): say it another way, and use notes set --retract or --delete for those")
     return words
 
 
@@ -325,6 +335,8 @@ def _find(doc: Doc, claim: str) -> Item:
     item = doc.by_id().get(claim)
     if item is None:
         raise ToolError(f"no claim {claim} in this topic")
+    if item.deleted:
+        raise ToolError(f"{claim} was deleted")
     return item
 
 
@@ -382,7 +394,7 @@ def set_claim(text: str, words: str, tag: str, *, replaces: str | None = None,
 
 
 def retract(text: str, claim: str, by: str, why: str) -> tuple[str, list[str]]:
-    """Mark a claim retracted, and take out of Current what rests on it. Nothing is deleted."""
+    """Mark a claim retracted, and take out of Current what rests on it. Its text stays, in Log."""
     doc = parse(text)
     lines = list(doc.lines)
     _no_marks(why)
@@ -403,6 +415,32 @@ def retract(text: str, claim: str, by: str, why: str) -> tuple[str, list[str]]:
     else:
         del lines[item.start:item.end]
         _log(lines, line)
+    _take_out(lines, dependents, claim)
+    return "\n".join(lines), dependents
+
+
+def delete(text: str, claim: str, why: str, by: str | None = None) -> tuple[str, list[str]]:
+    """Take a claim out of the notes, text and all, and what rests on it out of Current. One line with its id,
+    the date, the claim that shows it wrong if one does, and why stays in Log. The notes' git history still
+    has the text."""
+    doc = parse(text)
+    lines = list(doc.lines)
+    _no_marks(why)
+    if not why.strip():
+        raise ToolError("a delete needs --why WORDS")
+    item = _find(doc, claim)
+    dependents = _dependents(doc, claim)
+    if by is not None:
+        witness = _find(doc, by)
+        if by == claim:
+            raise ToolError(f"{claim} can't show itself wrong: name another claim, or leave out --by")
+        if witness.section != "Current":
+            raise ToolError(f"{by} isn't in Current, and only what's seen or said can show a claim wrong")
+        if by in dependents:
+            raise ToolError(f"{by} rests on {claim}, so it can't be what shows {claim} wrong")
+    shown = f" by {by}" if by else ""
+    del lines[item.start:item.end]
+    _log(lines, f"- {claim} DELETED {date.today().isoformat()}{shown}: {why}")
     _take_out(lines, dependents, claim)
     return "\n".join(lines), dependents
 

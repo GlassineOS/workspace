@@ -46,7 +46,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
-import os
 import re
 import subprocess
 import sys
@@ -130,6 +129,8 @@ def warnings(r, a, stamp, base, binary) -> list[str]:
 def inside(a) -> int:
     """Under the lock when there is one: the stamp, the run, the result."""
     r = load(a.reproducer)
+    if r["device"]:
+        kitlib.check_held(a.name, r["does"])
     source = kitlib.resolve_source(r["source"], r["folder"], r["where"])
     stamp = kitlib.stamp() if r["device"] else {"device": None}
     base = kitlib.stamped(stamp, "base") or a.base or "unknown"
@@ -140,7 +141,7 @@ def inside(a) -> int:
     notes = warnings(r, a, stamp, base, binary)
     for note in notes:
         print(f"repro: warning: {note}", file=sys.stderr)
-    commit, changed = kitlib.kit_commit()
+    commit, changed = kitlib.tool_commit()
     name = kitlib.result_name("repro", r["name"])
     seconds = kitlib.duration(r["run"]["timeout"], r["where"])
     with kitlib.scratch("repro") as where:
@@ -148,14 +149,10 @@ def inside(a) -> int:
         if r["run"]["where"] == "device":
             config = devlib.load_config()
             kitlib.check_device_script(source, r["where"])
-            ran = kitlib.run_bounded([*devlib.Device(config).argv, "sh -s"], log, stdin=source.read_bytes(), seconds=seconds)
+            ran = kitlib.run_bounded([*devlib.Device(config).argv, "sh -s"], log, stdin=kitlib.device_script(source.read_bytes()), seconds=seconds)
         else:
-            fill = {"{source}": str(source), "{dir}": str(r["folder"])}
-            argv = [fill.get(x, x) for x in r["run"]["command"]]
-            env = {**os.environ}
-            if r["device"]:
-                env["GLASSINE_DEV_SSH"] = devlib.load_config().ssh
-            ran = kitlib.run_bounded(argv, log, seconds=seconds, env=env, cwd=r["folder"])
+            argv = kitlib.fill_command(r["run"]["command"], source, r["folder"])
+            ran = kitlib.run_bounded(argv, log, seconds=seconds, env=kitlib.host_env(r["device"]), cwd=r["folder"])
         log.touch()
         output = log.read_text(errors="replace")
         result, why = ("stopped", "stopped from outside") if ran.stopped else judge(r, ran, output)
@@ -163,7 +160,7 @@ def inside(a) -> int:
     inputs = [r["source"]["artifact"]] if "artifact" in r["source"] else []
     record = {"reproducer": r["name"], "base": base, "result": result, "why": why, "exit": ran.code, "seconds": ran.seconds,
               "binary": r["run"].get("binary"), "binary_sha256": binary, "source_sha256": artstore.digest(source), "inputs": inputs,
-              "fixes": r["fixes"], "does": r["does"], "kit_commit": commit, "kit_changed": changed, "by": a.name or a.by,
+              "fixes": r["fixes"], "does": r["does"], "tool_commit": commit, "tool_changed": changed, "by": a.name or a.by,
               "time": wslib.utc(), "stamp": stamp, "warnings": notes, "log": log_id}
     summary = {k: record[k] for k in ("reproducer", "base", "result", "binary_sha256", "source_sha256", "warnings")}
     entry = kitlib.store_result(record, "repro", name, f"reproducer {r['name']} on {base}: {result}", a.by, "repro", summary)

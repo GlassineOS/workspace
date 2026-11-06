@@ -80,8 +80,9 @@ tools/bench eye --binary X --setting K=V --content W --said W    # an eye test i
   does. Its result names the base the device stamped, and warns when that isn't the base you said, when the binary differs
   from earlier results there, or when something is bound over a live binary. A bound binary isn't the base's own.
 - **One invalid arm invalidates a comparison,** and an invalid result prints no number. Don't dig its numbers out of the
-  log to quote. A scroll run proves motion from counters `bench` reads itself. `bench eye --said` is for words the person
-  typed to you, never a relay or your own reading of them.
+  log to quote. A scroll run proves motion from counters `bench` reads itself. A device result names the kit that ran,
+  by the Kit ID from `dev stamp` (the `kit_id` probe in `dev.toml`), not this checkout's commit, and without a Kit ID
+  nothing runs. `bench eye --said` is for words the person typed to you, never a relay or your own reading of them.
 
 **Writing a tool:** Python 3, standard library only, an executable with no extension in `tools/`, and the SPDX header
 like `ws`. `tools/wslib.py` finds `artifacts/` and `notes/` from `~/GlassineOS`, so it works from a worktree;

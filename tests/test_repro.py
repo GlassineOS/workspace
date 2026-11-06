@@ -76,6 +76,16 @@ def set_probe(kit, name, command):
 # --- running under the lock
 
 
+def test_inside_runs_only_under_the_lock(kit):
+    kit.simple(script=f'touch "{kit.tmp}/ran"\n', top='does = ["close-apps"]')
+    set_probe(kit, "compositor_sha256", "echo c0ffee")
+    assert "isn't held by nobody" in kit.repro("_inside", "widget-hang", "--as", "nobody", code=1).stderr
+    assert "--as" in kit.repro("_inside", "widget-hang", code=1).stderr
+    kit.take("a")
+    assert "doesn't cover close-apps" in kit.repro("_inside", "widget-hang", "--as", "a", code=1).stderr
+    assert not (kit.tmp / "ran").exists() and not kit.results()
+
+
 def test_a_run_stores_the_result_with_stamp_and_hashes_and_frees_the_lock(kit):
     kit.simple(more='[pass]\noutput_has = "fine"')
     set_probe(kit, "compositor_sha256", "echo c0ffee")
@@ -86,7 +96,7 @@ def test_a_run_stores_the_result_with_stamp_and_hashes_and_frees_the_lock(kit):
     record = kit.record(entry)
     assert record["base"] == "base-7" and record["result"] == "pass" and record["binary_sha256"] == "c0ffee"
     assert record["stamp"]["base"] == "base-7" and record["stamp"]["device_time"]  # dev's stamp, as dev prints it
-    assert len(record["source_sha256"]) == 64
+    assert len(record["source_sha256"]) == 64 and record["stamp"]["kit_id"] == "kit-3"
     log = artstore_log(kit, record)
     assert log.read_text() == "fine\n"
 

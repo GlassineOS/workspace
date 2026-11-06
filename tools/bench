@@ -24,37 +24,46 @@ bench/<name>/bench.toml:
   file = "run.sh"
 
   [run]
-  where = "device"                  the source goes to the device's sh. Or where = "host" and command = [...],
-  timeout = "5m"                    with {source} and {dir}. Per arm
+  where = "device"                  the source goes to the device's sh, with stdin from /dev/null. Or where = "host"
+  timeout = "5m"                    and command = [...], with {source} and {dir} anywhere in it. Per arm
   binary = "compositor"             what it tests: compositor, daemon or boot_image, from dev stamp
 
   [motion]                          kind = scroll must have it, and only scroll may
-  read = "cat /sys/..."             shell on the device, printing one integer: read before and after each arm
+  read = "cat /sys/..."             shell on the device, printing one integer: read before and after each arm.
+                                    Never /run: the check is a text match, not a guard, and a read that blocks
+                                    is only ended by ssh_seconds
   at_least = 100                    how far it must move
 
   [[arm]]
   name = "a"
   settings = { speed = 2 }          in the environment: GLASSINE_BENCH_ARM, GLASSINE_BENCH_SETTINGS (JSON)
 
-A run prints what it measured as lines of "bench: METRIC NUMBER", and exits 0.
+A run prints what it measured as lines of "bench: METRIC NUMBER", each metric once, and exits 0.
 
-An arm is invalid if it fails, times out or prints no metric, if its metrics differ from the other arms', or, for a
-scroll run, if the counters bench reads itself didn't move (motion_proved false: what the script says doesn't count).
-The whole result is invalid if the base, a binary, the renderer or a bind changed under it. The run ends at the first
-invalid arm. An invalid result is stored without its numbers and prints none. Exit: 0 valid, 1 invalid, 77 skipped.
+An arm is invalid if it fails, times out or prints no metric, if a "bench:" line doesn't parse, a metric comes twice or
+isn't a finite number, if its metrics differ from the other arms', or, for a scroll run, if the counters bench reads
+itself didn't move (motion_proved false: what the script says doesn't count). The whole result is invalid if the kit,
+the base, a binary, the renderer or a bind changed under it. The run ends at the first invalid arm. An invalid result is
+stored without its numbers and prints none. Exit: 0 valid, 1 invalid, 77 skipped.
 
-Every result records the commit of the kit, this checkout. Results go to artifacts/bench by id: the numbers stay there.
+Every device result records the kit that ran: the Kit ID from dev stamp (the kit_id probe in dev.toml), and the base.
+With no Kit ID, or no hash for [run] binary, nothing runs: a number that can't say what it measured isn't a result.
+The commit of this checkout is recorded too, as tool_commit. Results go to artifacts/bench by id: the numbers stay there.
 gpu-host records what else was running on this host before each arm.
 
+A timeout ends the local ssh. Whether the device's sh dies with it hasn't been tried on a device.
+
 eye records an eye test, with user provenance: the binary, the settings, the content shown and the person's words.
---said is for words the person typed to you, never a relay or your own reading of them. X is compositor, daemon (from
-dev stamp), a sha256, or a file here.
+--said is for words the person typed to you, never a relay or your own reading of them: nothing can tell. X is
+compositor, daemon (from dev stamp), a sha256, or a file here. The binary's hash is the one when it's recorded, not
+when the person looked, and nothing about an eye test is checked: valid on one only means it's a record.
 """
 from __future__ import annotations
 
 import argparse
 import getpass
 import json
+import math
 import os
 import re
 import shlex
@@ -73,8 +82,8 @@ from wslib import ToolError  # noqa: E402
 
 KEYS = {"what", "kind", "rounds", "expect", "does", "needs", "device", "inputs", "source", "run", "motion", "arm"}
 KINDS = ("scroll", "gpu-host", "plain")
-METRIC = re.compile(r"^bench: (\S+) (-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*$", re.M)
-SHOULD_HOLD = ("base", "boot_image", "compositor_sha256", "daemon_sha256", "renderer", "fallback_flag", "bound")
+METRIC = re.compile(r"bench: (\S+) (-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*")
+SHOULD_HOLD = ("kit_id", "base", "boot_image", "compositor_sha256", "daemon_sha256", "renderer", "fallback_flag", "bound")
 PROCESSES = 25
 
 
@@ -94,11 +103,12 @@ def load(name: str) -> dict:
     inputs = kitlib.words_list(table, "inputs", where)
     for item in inputs:
         kitlib.check_source({"source": {"artifact": item}}, where)
+    if "file" in source and not (folder / source["file"]).is_file():
+        raise ToolError(f"{where}: [source] file {source['file']} isn't there")
     if run["where"] == "device":
         if inputs or "artifact" in source:
             raise ToolError(f"{where}: a private input is for a host run, as it goes by path on this host")
-        if (folder / source.get("file", "")).is_file():
-            kitlib.check_device_script(folder / source["file"], where)
+        kitlib.check_device_script(folder / source["file"], where)
     if kind == "gpu-host" and run["where"] != "host":
         raise ToolError(f"{where}: kind = gpu-host is where = host")
     motion = table.get("motion")
@@ -148,6 +158,26 @@ def read_counter(device: devlib.Device, command: str) -> int | None:
     return int(text) if done.returncode == 0 and re.fullmatch(r"-?\d+", text) else None
 
 
+def metrics_of(output: str) -> tuple[dict, list[str]]:
+    """The metrics a run printed, and what's wrong with them. A line that starts "bench:" and doesn't parse, a metric
+    printed twice, or one that isn't a finite number makes the arm invalid: none of it is dropped quietly."""
+    metrics, wrong = {}, []
+    for line in output.splitlines():
+        if not line.startswith("bench:"):
+            continue
+        m = METRIC.fullmatch(line)
+        if not m:
+            wrong.append(f"a line that doesn't parse as \"bench: METRIC NUMBER\": {line[:80]!r}")
+            continue
+        value = float(m[2])
+        if m[1] in metrics:
+            wrong.append(f"{m[1]} printed twice: a metric is one number per arm")
+        elif not math.isfinite(value):
+            wrong.append(f"{m[1]} isn't a finite number")
+        metrics[m[1]] = value
+    return metrics, wrong
+
+
 def host_processes() -> tuple[str | None, list[float]]:
     done = subprocess.run(["ps", "-eo", "pid=,pcpu=,comm=", "--sort=-pcpu"], capture_output=True, text=True)
     if done.returncode:
@@ -155,7 +185,7 @@ def host_processes() -> tuple[str | None, list[float]]:
     return "\n".join(done.stdout.splitlines()[:PROCESSES]), list(os.getloadavg())
 
 
-def device_prefix(arm: dict) -> bytes:
+def arm_env(arm: dict) -> bytes:
     return (f"GLASSINE_BENCH_ARM={shlex.quote(arm['name'])} GLASSINE_BENCH_SETTINGS={shlex.quote(json.dumps(arm.get('settings', {})))}\n"
             "export GLASSINE_BENCH_ARM GLASSINE_BENCH_SETTINGS\n").encode()
 
@@ -163,13 +193,10 @@ def device_prefix(arm: dict) -> bytes:
 def one_arm(r, arm, source, inputs, log: Path, seconds: int) -> kitlib.Ran:
     if r["run"]["where"] == "device":
         argv = [*devlib.Device(devlib.load_config()).argv, "sh -s"]
-        return kitlib.run_bounded(argv, log, stdin=device_prefix(arm) + source.read_bytes(), seconds=seconds)
-    fill = {"{source}": str(source), "{dir}": str(r["folder"])}
-    env = {**os.environ, "GLASSINE_BENCH_ARM": arm["name"], "GLASSINE_BENCH_SETTINGS": json.dumps(arm.get("settings", {})),
-           "GLASSINE_BENCH_INPUTS": os.pathsep.join(map(str, inputs))}
-    if r["device"]:
-        env["GLASSINE_DEV_SSH"] = devlib.load_config().ssh
-    return kitlib.run_bounded([fill.get(x, x) for x in r["run"]["command"]], log, seconds=seconds, env=env, cwd=r["folder"])
+        return kitlib.run_bounded(argv, log, stdin=kitlib.device_script(source.read_bytes(), arm_env(arm)), seconds=seconds)
+    env = kitlib.host_env(r["device"], GLASSINE_BENCH_ARM=arm["name"], GLASSINE_BENCH_SETTINGS=json.dumps(arm.get("settings", {})),
+                          GLASSINE_BENCH_INPUTS=os.pathsep.join(map(str, inputs)))
+    return kitlib.run_bounded(kitlib.fill_command(r["run"]["command"], source, r["folder"]), log, seconds=seconds, env=env, cwd=r["folder"])
 
 
 def run_arms(r, source, inputs, where: Path) -> tuple[list[dict], list[str], Path]:
@@ -195,7 +222,7 @@ def run_arms(r, source, inputs, where: Path) -> tuple[list[dict], list[str], Pat
             f.write(f"--- {tag}\n{output}")
         part.unlink()
         entry |= {"exit": ran.code, "seconds": ran.seconds}
-        metrics = {m[1]: float(m[2]) for m in METRIC.finditer(output)}
+        metrics, wrong = metrics_of(output)
         entry["metrics"] = metrics
         if ran.stopped:
             reasons.append(f"{tag}: stopped from outside")
@@ -203,6 +230,8 @@ def run_arms(r, source, inputs, where: Path) -> tuple[list[dict], list[str], Pat
             reasons.append(f"{tag}: timed out after {r['run']['timeout']}")
         elif ran.code != 0:
             reasons.append(f"{tag}: exit {ran.code}")
+        elif wrong:
+            reasons += [f"{tag}: {w}" for w in wrong]
         elif not metrics:
             reasons.append(f"{tag}: printed no metric")
         elif runs and set(metrics) != set(runs[0]["metrics"]):
@@ -237,16 +266,33 @@ def scrub(runs: list[dict]) -> list[dict]:
     return [{k: v for k, v in run.items() if k != "metrics"} | {"metrics": None} for run in runs]
 
 
+def unknown_under(r: dict, stamp: dict) -> list[str]:
+    """What a device result must be able to name before anything runs: the kit, and the binary it tests."""
+    out = []
+    if not kitlib.stamped(stamp, "kit_id"):
+        out.append(f"the stamp has no Kit ID ({stamp.get('kit_id')}): set the kit_id probe in dev.toml")
+    binary = r["run"].get("binary")
+    if binary and not kitlib.binary_hash(stamp, binary):
+        key = f"{binary}_sha256" if binary in ("compositor", "daemon") else binary
+        out.append(f"the stamp has no {key} ({stamp.get(key)}), so nothing says which {binary} this measures")
+    return out
+
+
 def inside(a) -> int:
     r = load(a.bench)
-    commit, changed = kitlib.kit_commit()
+    if r["device"]:
+        kitlib.check_held(a.name, r["does"])
+    commit, changed = kitlib.tool_commit()
     source = kitlib.resolve_source(r["source"], r["folder"], r["where"])
     inputs = [kitlib.resolve_input(x) for x in r["inputs"]]
     stamp = kitlib.stamp() if r["device"] else {"device": None}
+    unknown = unknown_under(r, stamp) if r["device"] else []
+    if unknown:
+        raise ToolError("nothing ran: " + "; ".join(unknown))
     name = kitlib.result_name("bench", r["name"])
     with kitlib.scratch("bench") as where:
         runs, reasons, log = run_arms(r, source, inputs, Path(where))
-        after = stamp
+        after = None  # never read, rather than a copy of the stamp before
         if r["device"] and not reasons:
             try:
                 after = kitlib.stamp()
@@ -256,15 +302,16 @@ def inside(a) -> int:
         log_id = kitlib.store_log(log, "bench", name, f"output of bench {r['name']}", a.by)
     valid = not reasons
     private = [r["source"]["artifact"]] if "artifact" in r["source"] else []
-    record = {"bench": r["name"], "kind": r["kind"], "provenance": "measured", "valid": valid, "invalid_because": reasons, "kit_commit": commit,
-              "kit_changed": changed, "by": a.name or a.by, "time": wslib.utc(), "arms": r["arms"], "rounds": r["rounds"],
+    kit = kitlib.stamped(stamp, "kit_id")
+    record = {"bench": r["name"], "kind": r["kind"], "provenance": "measured", "valid": valid, "invalid_because": reasons, "kit_id": kit,
+              "base": kitlib.stamped(stamp, "base"), "tool_commit": commit, "tool_changed": changed, "by": a.name or a.by, "time": wslib.utc(), "arms": r["arms"], "rounds": r["rounds"],
               "binary": r["run"].get("binary"), "binary_sha256": kitlib.binary_hash(stamp, r["run"].get("binary")), "does": r["does"],
               "source_sha256": artstore.digest(source), "inputs": [*private, *r["inputs"]], "stamp": stamp, "stamp_after": after,
               "log": log_id, "runs": runs if valid else scrub(runs), "summary": summary_of(runs) if valid else None}
     if r["motion"]:
         record["motion_proved"] = bool(runs) and all(run.get("motion_proved") for run in runs)
     what = f"bench {r['name']}: " + ("valid" if valid else "invalid")
-    entry = kitlib.store_result(record, "bench", name, what, a.by, "bench", {"bench": r["name"], "valid": valid, "kit_commit": commit, "provenance": "measured"})
+    entry = kitlib.store_result(record, "bench", name, what, a.by, "bench", {"bench": r["name"], "valid": valid, "kit_id": kit, "provenance": "measured"})
     print_record(record, entry["id"])
     return 0 if valid else 1
 
@@ -279,7 +326,8 @@ def print_record(record: dict, ident: str) -> None:
         for reason in record["invalid_because"]:
             print(f"  {reason}")
     else:
-        print(f"{label}: valid. Result {ident}, kit {record['kit_commit'][:12]}" + (" with changes on top" if record["kit_changed"] else ""))
+        on = f"kit {record['kit_id']}" + (f" on base {record['base']}" if record.get("base") else "") if record.get("kit_id") else "on this host"
+        print(f"{label}: valid. Result {ident}, {on}, tool {record['tool_commit'][:12]}" + (" with changes on top" if record["tool_changed"] else ""))
         for arm, metrics in record["summary"].items():
             for metric, s in metrics.items():
                 print(f"  {arm}  {metric}  median {s['median']:g}  ({s['min']:g} to {s['max']:g}, n={s['n']})")
@@ -289,11 +337,14 @@ def run(a) -> int:
     r = load(a.bench)
     if r["device"] and not a.name:
         raise ToolError("--as: this needs the device, and so the lock")
-    commit, changed = kitlib.kit_commit()
+    commit, changed = kitlib.tool_commit()
     if commit is None:
-        raise ToolError(f"{kitlib.root()} isn't a git checkout: a result records the kit's commit, so nothing runs")
+        raise ToolError(f"{kitlib.root()} isn't a git checkout: a result records the definition's commit, so nothing runs")
     if changed:
-        print("bench: warning: the kit has changes on top of its commit, and the result will say so", file=sys.stderr)
+        print("bench: warning: this checkout has changes on top of its commit, and the result will say so", file=sys.stderr)
+    longest = r["rounds"] * len(r["arms"]) * kitlib.duration(r["run"]["timeout"], r["where"])
+    if r["device"] and longest > kitlib.duration(r["expect"], r["where"]):
+        print(f"bench: warning: rounds × arms × timeout is {longest} s, longer than expect = {r['expect']}", file=sys.stderr)
     kitlib.resolve_source(r["source"], r["folder"], r["where"])  # a missing private input stops it before any lock
     for item in r["inputs"]:
         kitlib.resolve_input(item)
@@ -344,13 +395,15 @@ def eye(a) -> int:
     for item in a.input:
         kitlib.check_source({"source": {"artifact": item}}, "--input")
     stamp = eye_stamp()
-    commit, changed = kitlib.kit_commit()
+    commit, changed = kitlib.tool_commit()
+    kit = kitlib.stamped(stamp, "kit_id")
     record = {"bench": None, "label": a.label, "kind": "eye", "provenance": "user", "said": a.said, "binary_sha256": eye_binary(a.binary, stamp),
-              "settings": settings, "content": a.content, "inputs": a.input, "kit_commit": commit, "kit_changed": changed,
+              "settings": settings, "content": a.content, "inputs": a.input, "kit_id": kit, "base": kitlib.stamped(stamp, "base"),
+              "tool_commit": commit, "tool_changed": changed,
               "by": a.by, "time": wslib.utc(), "stamp": stamp, "valid": True}
     name = kitlib.result_name("eye", a.label or "test")
     entry = kitlib.store_result(record, "bench", name, f"eye test {a.label or ''}".strip(), a.by, "bench",
-                                {"bench": a.label, "valid": True, "kit_commit": commit, "provenance": "user"})
+                                {"bench": a.label, "valid": True, "kit_id": kit, "provenance": "user"})
     print_record(record, entry["id"])
     return 0
 
@@ -361,7 +414,7 @@ def results(a) -> int:
         if e.get("tombstone") or not tag or (a.name and tag.get("bench") != a.name):
             continue
         state = "eye test" if tag["provenance"] == "user" else "valid" if tag["valid"] else "INVALID"
-        print(f"{e['id']}  {tag.get('bench') or ''}  {state}  {e['made']}  kit {(tag.get('kit_commit') or 'unknown')[:12]}")
+        print(f"{e['id']}  {tag.get('bench') or ''}  {state}  {e['made']}  kit {tag.get('kit_id') or 'unknown'}")
     return 0
 
 
@@ -409,7 +462,7 @@ def main(argv=None) -> int:
     e.add_argument("--binary", required=True)
     e.add_argument("--setting", action="append", required=True, metavar="KEY=VALUE")
     e.add_argument("--content", required=True, help="what was on the panel")
-    e.add_argument("--said", required=True, help="the person's words")
+    e.add_argument("--said", required=True, help="the person's words, as they typed them to you: nothing can check that")
     e.add_argument("--label")
     e.add_argument("--input", action="append", default=[], help="a private input, by artifact id")
     e.add_argument("--by", default=getpass.getuser())

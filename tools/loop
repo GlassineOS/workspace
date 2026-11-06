@@ -259,8 +259,8 @@ def bring_down(a, device, recipes) -> int:
         return 0
     # all stopped first, so a set never speaks across versions on the way back either
     stops = "\n".join(looplib.stop_block(r) for r in known if binds_now(device, r, st))
-    steps = "\n".join(f"sh {shlex.quote(r.folder + '/restore.sh')} || loop_failed=$?" for r in known)
-    done = device.run(f"set -u\nloop_failed=0\n{stops}\n{steps}\nexit \"$loop_failed\"\n")
+    steps = "\n".join(f"sh {shlex.quote(r.folder + '/restore.sh')} </dev/null || loop_failed=$?" for r in known)
+    done = device.run(looplib.grouped(f"set -u\nloop_failed=0\n{stops}\n{steps}\nexit \"$loop_failed\"\n"))
     sys.stderr.write(done.stderr)
     if done.returncode:
         print(f"loop: restore: exit {done.returncode}, see above. Reboot is the rollback", file=sys.stderr)

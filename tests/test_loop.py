@@ -895,3 +895,42 @@ def test_as_is_needed(lp):
     assert "--as" in lp.loop("up", "widgetd", code=1).stderr
     assert "takes no command" in lp.loop("up", "widgetd", "--as", "a", "--", "true", code=1).stderr
     assert "needs a test" in lp.loop("run", "widgetd", "--as", "a", code=1).stderr
+
+
+def running(lp, name="widgetd"):
+    return subprocess.run([str(lp.device.bin / "pidof"), "-s", name], capture_output=True).returncode == 0
+
+
+STDIN_LIVE = "[live]\nreapply = 'cat >/dev/null; echo \"reapply-g $name=$value\" >> {r}/steps'\n"
+
+
+def bound_at(lp, path):
+    return f" {path} " in (lp.r / "mountinfo").read_text()
+
+
+def test_a_reapply_that_reads_stdin_doesnt_eat_the_rest_of_the_script(lp):
+    lp.recipe("gadgetd", top='set = "wire"', more=STDIN_LIVE.format(r=lp.r))
+    lp.recipe("widgetd", top='set = "wire"', more=live(lp))
+    lp.take("a")
+    record_live(lp, "speed", "fast")
+    lp.loop("up", "--set", "wire", "--as", "a")
+    assert [s for s in lp.log() if s.startswith("reapply")] == ["reapply-g speed=fast", "reapply speed"]  # the second recipe's still ran
+    lp.steps.write_text("")
+    done = lp.loop("restore", "--set", "wire", "--as", "a")
+    assert "gadgetd: restored" in done.stdout and "widgetd: restored" in done.stdout
+    assert [s for s in lp.log() if s.startswith("reapply")] == ["reapply-g speed=fast", "reapply speed"]
+    assert not bound_at(lp, lp.target) and not bound_at(lp, lp.r / "usr-bin" / "gadgetd")
+    assert running(lp) and running(lp, "gadgetd")
+    assert not [k for k in lp.overrides() if k.startswith("loop-")] and not (lp.storage / "loop-widgetd").exists()
+
+
+def test_every_script_is_one_group_with_no_stdin(lp):
+    lp.recipe(more=live(lp))
+    lp.take("a")
+    lp.loop("up", "widgetd", "--as", "a")
+    lp.loop("restore", "widgetd", "--as", "a")
+    r = lp.recipe_obj()
+    assert "</dev/null" in looplib.reapply_block(r, "/store", "cat boot").split("timeout 5", 1)[1].splitlines()[0]
+    chunks = [x for x in lp.scripts().split("\n{\n") if "mount --bind" in x or "restore.sh </dev/null" in x]
+    assert len(chunks) == 2 and all("\n} </dev/null\n" in x for x in chunks)  # up, and restore
+    assert looplib.up_script([r], "/store", "b", "m", "who", "boot", {r.name: "sha"}).endswith("\n} </dev/null\n")

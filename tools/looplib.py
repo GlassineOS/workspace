@@ -186,6 +186,12 @@ def check_setting(key: str, value: str) -> None:
 # --- shell. Everything from a recipe or the command line is quoted, or checked above. A recipe's own commands are shell.
 
 
+def grouped(script: str) -> str:
+    """What goes to the device's sh -s: one { } group, read whole before any of it runs, with no stdin, so a command in it
+    that reads stdin can't eat the rest of the script. The same guard as kitlib.device_script."""
+    return kitlib.device_script(script.encode()).decode()
+
+
 def fail(words: str, code: int) -> str:
     return f"{{ echo {quote('loop: ' + words)} >&2; exit {code}; }}"
 
@@ -224,7 +230,7 @@ def start_block(r: Recipe) -> str:
     """The session's own environment, saved before anything stopped, and nothing else."""
     return f"""LOOP_START={quote(r.start)}
 export LOOP_START
-nohup xargs -0 sh -c 'exec env -i "$@" sh -c "$LOOP_START"' loop-start < {quote(r.folder + '/session.environ')} >> {quote(r.log)} 2>&1 &
+nohup xargs -0 sh -c 'exec env -i "$@" sh -c "$LOOP_START" </dev/null' loop-start < {quote(r.folder + '/session.environ')} >> {quote(r.log)} 2>&1 &
 unset LOOP_START
 loop_n=0
 until {running(r)}; do
@@ -251,7 +257,7 @@ done"""
 def reapply_block(r: Recipe, store: str, boot: str) -> str:
     """Live values from overrides.d: the ones it can see. One set and never recorded is lost, and can't be known."""
     records = quote(store + "/overrides.d")
-    timed = f"timeout 5 sh -c {quote(r.reapply)}" if r.reapply else "false"
+    timed = f"timeout 5 sh -c {quote(r.reapply)} </dev/null" if r.reapply else "false"
     word = "couldn't reapply" if r.reapply else "no reapply in the recipe, so it's lost:"
     return f"""loop_boot=$( ( {boot}
 ) 2>/dev/null </dev/null )
@@ -333,7 +339,7 @@ def up_script(recipes: list[Recipe], store: str, boot_probe: str, binds: str, ow
     for r in recipes:
         out.append(reapply_block(r, store, boot_probe))
     out.append('exit "$loop_lost"')
-    return "\n".join(out) + "\n"
+    return grouped("\n".join(out) + "\n")
 
 
 def restore_script(r: Recipe, store: str, boot_probe: str, binds: str) -> str:

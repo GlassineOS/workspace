@@ -934,3 +934,59 @@ def test_every_script_is_one_group_with_no_stdin(lp):
     chunks = [x for x in lp.scripts().split("\n{\n") if "mount --bind" in x or "restore.sh </dev/null" in x]
     assert len(chunks) == 2 and all("\n} </dev/null\n" in x for x in chunks)  # up, and restore
     assert looplib.up_script([r], "/store", "b", "m", "who", "boot", {r.name: "sha"}).endswith("\n} </dev/null\n")
+
+
+def test_a_second_restore_after_a_failed_start_starts_it_and_keeps_the_record_until_then(lp):
+    lp.recipe(more=live(lp))
+    lp.take("a")
+    lp.loop("up", "widgetd", "--as", "a")
+    (lp.r / "wont-start").touch()
+    done = lp.loop("restore", "widgetd", "--as", "a", code=1)
+    assert "didn't start" in done.stderr and "restored" not in done.stdout
+    assert not lp.bound() and not running(lp)
+    assert "loop-widgetd" in lp.overrides() and (lp.storage / "loop-widgetd" / "restore.sh").exists()  # what the exit message says to retry from
+    (lp.r / "wont-start").unlink()
+    lp.steps.write_text("")
+    done = lp.loop("restore", "widgetd", "--as", "a")
+    assert "widgetd: restored" in done.stdout
+    assert lp.log() == ["start widgetd"]  # the stop and the unmount were already done
+    assert running(lp) and not lp.bound()
+    assert not lp.overrides() and not (lp.storage / "loop-widgetd").exists()
+
+
+def test_a_second_restore_after_a_failed_config_write_writes_it_and_starts(lp):
+    lp.recipe(more=conf(lp))
+    lp.take("a")
+    lp.loop("up", "widgetd", "--as", "a", "--config", "widgetd:@a=9")
+    real = shutil.which("stat")
+    lp.tool_script("stat", f'''if [ "$3" = {lp.conf} ] && [ -e {lp.r}/stat-breaks ]; then
+  n=$(cat {lp.r}/stat-count 2>/dev/null || echo 0)
+  echo $((n + 1)) > {lp.r}/stat-count
+  [ $((n % 2)) = 1 ] && {{ echo changed; exit 0; }}
+fi
+exec {real} "$@"''')
+    (lp.r / "stat-breaks").touch()
+    assert "changed inode, mode or owner" in lp.loop("restore", "widgetd", "--as", "a", code=1).stderr
+    assert not lp.bound() and not running(lp)
+    assert "loop-widgetd" in lp.overrides() and (lp.storage / "loop-widgetd").is_dir()
+    (lp.r / "stat-breaks").unlink()
+    lp.steps.write_text("")
+    done = lp.loop("restore", "widgetd", "--as", "a")
+    assert "widgetd: restored" in done.stdout and lp.log() == ["start widgetd"]
+    assert running(lp) and lp.conf.read_text() == "@a=1\n@b=2\n"
+    assert not [k for k in lp.overrides() if k.startswith("loop-")] and not (lp.storage / "loop-widgetd").exists()
+
+
+def test_restored_means_the_process_is_running(lp):
+    lp.recipe(more=conf(lp))
+    lp.take("a")
+    lp.loop("up", "widgetd", "--as", "a", "--config", "widgetd:@a=9")
+    lp.dev("release", "--as", "a")
+    lp.device.set("boot_id", "boot-2")
+    lp.device.set("mountinfo", "20 1 0:20 / / rw - ext4 /dev/root rw")
+    lp.take("a", "--dirty", "after a reboot")
+    (lp.r / "pid.widgetd").unlink()  # nothing started it after the reboot
+    lp.steps.write_text("")
+    done = lp.loop("restore", "widgetd", "--as", "a", code=1)
+    assert "widgetd isn't running" in done.stderr and "restored" not in done.stdout
+    assert lp.log() == []  # a rolled-back bind still restarts nothing

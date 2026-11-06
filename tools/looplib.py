@@ -343,26 +343,37 @@ def up_script(recipes: list[Recipe], store: str, boot_probe: str, binds: str, ow
 
 
 def restore_script(r: Recipe, store: str, boot_probe: str, binds: str) -> str:
-    """Kept in the override's folder, so it also works by hand, by anyone, with no tool and no recipe."""
+    """Kept in the override's folder, so it also works by hand, by anyone, with no tool and no recipe.
+
+    It restarts the process when the target is bound, and also when the record is from this boot: then a bind that isn't
+    there is loop's own unmount, from a restore that failed after it, and the stop, the config and the start are still owed.
+    The record and the folder go only once the process is running. A record from another boot is a bind a reboot rolled back."""
     records = quote(store + "/overrides.d")
+    record = quote(f"{store}/overrides.d/{r.override}")
     restart = "\n".join([stop_block(r), unmount_block(r, binds)])
-    after = "\n".join([start_block(r), reapply_block(r, store, boot_probe)])
+    after = "\n".join([f"if {running(r)}; then echo {quote(f'loop: {r.binary} is already running')} >&2; else", start_block(r), "fi",
+                       reapply_block(r, store, boot_probe)])
     return f"""#!/bin/sh
 # Takes {r.target} back to what the system has. Stop first, plain unmount, and then the start.
 set -u
 loop_lost=0
+loop_now=$( ( {boot_probe}
+) 2>/dev/null </dev/null )
 if {is_bound(r, binds)}; then loop_was_bound=1; else loop_was_bound=0; fi
+loop_mine=0
+if [ -f {record} ] && [ -n "$loop_now" ] && [ "$(sed -n 's/^boot_id: //p' {record})" = "$loop_now" ]; then loop_mine=1; fi
 if [ "$loop_was_bound" = 1 ]; then
 {restart}
 fi
 if [ -f {quote(r.folder + '/config.orig')} ]; then
 {write_config(r.config, r.folder + '/config.orig', 30) if r.config else ':'}
 fi
-if [ "$loop_was_bound" = 1 ]; then
+if [ "$loop_was_bound" = 1 ] || [ "$loop_mine" = 1 ]; then
 {after}
 else
   echo 'loop: {r.target} was not bound (a reboot rolls it back): no restart' >&2
 fi
+if ! {running(r)}; then echo {quote(f"loop: {r.binary} isn't running")} >&2; loop_lost=1; fi
 rm -f {records}/{r.override} {records}/{r.override}-config-*
 rm -rf {quote(r.folder)}
 exit "$loop_lost"

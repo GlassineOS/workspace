@@ -44,7 +44,9 @@ DEFAULTS = {
 }
 
 # Plain kernel interfaces. What's particular to a device has no default: it's set in dev.toml, and
-# until then the check and the stamp say "unknown".
+# until then the check and the stamp say "unknown". kit_id is one of those: it prints the Kit ID file on the
+# root file system (docs: Boot flow, Interfaces), which says which kit is installed: the modules and
+# device files a kernel image carries. No path is set anywhere yet.
 DEFAULT_PROBES = {
     "boot_id": "cat /proc/sys/kernel/random/boot_id",
     "hangchecks": "d=$(dmesg) || exit 1; printf '%s\\n' \"$d\" | grep -c hangcheck; exit 0",
@@ -55,7 +57,7 @@ DEFAULT_PROBES = {
 }
 CHECK_PROBES = ("renderer", "hangchecks", "binds", "_fallback", "_settings", "_seed")
 REPORT_PROBES = ("renderer", "base", "deployment", "boot_image", "bases", "_free_kb")
-STAMP_PROBES = ("renderer", "_fallback", "base", "boot_image", "compositor_sha256", "compositor_commit",
+STAMP_PROBES = ("renderer", "_fallback", "kit_id", "base", "boot_image", "compositor_sha256", "compositor_commit",
                 "daemon_sha256", "daemon_commit", "open_apps", "gpu_min_clock", "battery_temp", "charging")
 
 _RUN = re.compile(r"(?<![\w.$}-])(?:/var)?/run(?![\w.-])")

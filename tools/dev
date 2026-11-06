@@ -526,7 +526,7 @@ def stamp(a) -> int:
             return "unknown (no probe set)"
         return probe[1] if probe[0] == 0 and probe[1] else "unknown (probe failed)"
 
-    out = {"device": config.name, "device_time": clock(st.now), "base": got("base"), "boot_image": got("boot_image"),
+    out = {"device": config.name, "device_time": clock(st.now), "kit_id": got("kit_id"), "base": got("base"), "boot_image": got("boot_image"),
            "compositor_sha256": got("compositor_sha256"), "compositor_commit": got("compositor_commit"),
            "daemon_sha256": got("daemon_sha256"), "daemon_commit": got("daemon_commit"), "renderer": got("renderer"),
            "fallback_flag": got("_fallback"), "named_states": {k: v.get("why", "") for k, v in st.left.items()},

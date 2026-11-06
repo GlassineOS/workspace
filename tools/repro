@@ -69,6 +69,8 @@ def load(name: str) -> dict:
     common = kitlib.check_common(table, where)
     source = kitlib.check_source(table, where)
     run = kitlib.check_run(table, where, common["device"])
+    if "file" in source:
+        kitlib.within(folder / source["file"], folder, f"{where} [source] file")
     if run["where"] == "device" and "file" in source and (folder / source["file"]).is_file():
         kitlib.check_device_script(folder / source["file"], where)
     criterion = table.get("pass", {})

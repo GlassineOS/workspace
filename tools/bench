@@ -103,6 +103,8 @@ def load(name: str) -> dict:
     inputs = kitlib.words_list(table, "inputs", where)
     for item in inputs:
         kitlib.check_source({"source": {"artifact": item}}, where)
+    if "file" in source:
+        kitlib.within(folder / source["file"], folder, f"{where} [source] file")
     if "file" in source and not (folder / source["file"]).is_file():
         raise ToolError(f"{where}: [source] file {source['file']} isn't there")
     if run["where"] == "device":

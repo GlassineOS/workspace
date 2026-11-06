@@ -272,6 +272,52 @@ def test_a_host_only_reproducer_takes_no_lock_and_says_its_base(kit):
     assert record["base"] == "base-9" and record["binary_sha256"] == artstore.digest(binary)
 
 
+def host_only(kit, name="offline"):
+    return kit.define(name, """\
+        what = "never near the device"
+        device = false
+        [source]
+        file = "s.sh"
+        [run]
+        where = "host"
+        command = ["sh", "{source}"]
+        timeout = "1m"
+        """)
+
+
+def test_a_source_that_is_a_link_out_of_the_folder_is_refused(kit):
+    outside = kit.tmp / "outside.sh"
+    outside.write_text(f'touch "{kit.tmp}/ran"\n')
+    folder = host_only(kit)
+    (folder / "s.sh").symlink_to(outside)
+    assert "leaves" in kit.repro("check", code=1).stderr
+    assert "leaves" in kit.repro("run", "offline", "--base", "b", code=1).stderr
+    assert "leaves" in kit.repro("_inside", "offline", "--base", "b", code=1).stderr  # not only run's own check
+    assert not (kit.tmp / "ran").exists() and not kit.results()
+
+
+def test_a_source_that_is_a_link_inside_the_folder_is_fine(kit):
+    folder = host_only(kit)
+    (folder / "real.sh").write_text("echo fine\n")
+    (folder / "s.sh").symlink_to("real.sh")
+    kit.repro("check")
+    kit.repro("run", "offline", "--base", "b")
+    assert kit.record(kit.results()[0])["result"] == "pass"
+
+
+def test_a_definition_folder_or_toml_that_is_a_link_out_is_refused(kit):
+    elsewhere = kit.tmp / "elsewhere"
+    elsewhere.mkdir()
+    (kit.kit / "repro").mkdir()
+    (kit.kit / "repro" / "linked").symlink_to(elsewhere)
+    (elsewhere / "repro.toml").write_text('what="x"\n[source]\nfile="s"\n[run]\nwhere="host"\ncommand=["true"]\ntimeout="1m"\n')
+    assert "leaves" in kit.repro("check", "linked", code=1).stderr
+    folder = host_only(kit, "toml-linked")
+    (folder / "repro.toml").rename(kit.tmp / "moved.toml")
+    (folder / "repro.toml").symlink_to(kit.tmp / "moved.toml")
+    assert "leaves" in kit.repro("check", "toml-linked", code=1).stderr
+
+
 # --- private inputs
 
 

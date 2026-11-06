@@ -72,10 +72,21 @@ def read_toml(kind: str, name: str) -> tuple[dict, Path]:
     path = folder / f"{kind}.toml"
     if not path.is_file():
         raise ToolError(f"no {kind}/{name}/{kind}.toml")
+    within(folder, root() / kind, f"{kind}/{name}")
+    within(path, folder, f"{kind}/{name}/{kind}.toml")
     try:
         return tomllib.loads(path.read_text()), folder
     except tomllib.TOMLDecodeError as e:
         raise ToolError(f"{path}: {e}") from e
+
+
+def within(path: Path, folder: Path, what: str) -> Path:
+    """PATH, once symlinks are followed, must still be under FOLDER: a link can't take a definition's source
+    or the definition itself out of the folder it's reviewed in."""
+    resolved = path.resolve()
+    if not resolved.is_relative_to(folder.resolve()):
+        raise ToolError(f"{what}: {path} is a link that leaves {folder}: it has to stay inside")
+    return resolved
 
 
 def words_list(table: dict, key: str, where: str) -> list[str]:
@@ -165,6 +176,7 @@ def resolve_source(source: dict, folder: Path, where: str) -> Path:
     if "artifact" in source:
         return resolve_input(source["artifact"])
     path = folder / source["file"]
+    within(path, folder, f"{where} [source] file")
     if not path.is_file():
         raise ToolError(f"{where}: [source] file {source['file']} isn't there")
     return path

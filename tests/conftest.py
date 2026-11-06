@@ -31,6 +31,8 @@ class Workspace:
         monkeypatch.setenv("HOME", str(self.user_home))
 
     def tool(self, name, *args, code=0):
+        # A test that undoes the fixture's environment would run the tool in the real workspace.
+        assert os.environ.get("GLASSINE_WORKSPACE") == str(self.home) and os.environ.get("HOME") == str(self.user_home)
         done = subprocess.run([sys.executable, str(TOOLS / name), *map(str, args)], capture_output=True, text=True,
                               cwd=self.tmp)
         assert done.returncode == code, done.stdout + done.stderr

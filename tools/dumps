@@ -12,7 +12,8 @@
   dumps decoder FILE --mesa V [--image IMG] [--keep K] [--in-place | --copy]
 
 --mesa and --profile are those of the process that faulted: a Flatpak app doesn't load the system's.
-Say "unknown" rather than guess. Ring and preempt state are read from the dump and --log if they say.
+Say "unknown" rather than guess. Ring and preempt state are read from the dump and --log if they say. If those give
+more than one value for either, as a log with two faults does, it stays unknown and the flag has to say.
 
 A decoder is an artifact named crashdec-mesa-V, found through `art path`. show picks the one with the
 dump's Mesa version, or refuses. --image runs it in that container, for a binary built on another libc.
@@ -21,8 +22,8 @@ stdout only, so don't save it in a repository.
 
 group fingerprints on RBBM status, IB1 rem, ring and preempt state, and names no cause. IB2 rem splits one
 bug across dumps, and a shader hash is inferred, so both are shown beside it, the hash as a candidate.
-Dumps within 30 s on one kernel, or --event-with, are linked as one event: a second recovery can blame
-an innocent process.
+Dumps within 30 s of each other on one known kernel, or --event-with, are linked as one event: a second recovery can
+blame an innocent process. No device is recorded, so two devices on one kernel at the same moment would still link.
 
 A RAM dump's kernel log is kept always and its raw images until a date: then `art find --expired` lists
 them and `art rm` removes them. It keeps its build, for the symbols, from being removed. Capturing one
@@ -31,7 +32,9 @@ isn't here yet.
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
+import io
 import json
 import os
 import re
@@ -52,22 +55,33 @@ EVENT_WINDOW = 30  # seconds
 A5XX_CP_IB1_BUFSZ = 0xb21
 A5XX_CP_IB2_BUFSZ = 0xb24
 _HEADER = re.compile(r"(kernel|time|comm|cmdline|revision|rbbm-status): (.*)")
+_HEX = re.compile(r"(?:0x)?[0-9a-fA-F]+")
 _REGISTER = re.compile(r"\s+- \{ offset: 0x([0-9a-f]+), value: 0x([0-9a-f]+) \}")
-_PREEMPT = re.compile(r"\bcur rb (\d+), next rb \d+, preempt state (\d+)")
-_LOCKUP = re.compile(r"\blockup rb (\d+)")
+# Wording read from the kernel's source, not from a captured log. The kernel prints -1 for "no such ring".
+_PREEMPT = re.compile(r"\bnext rb -?\d+, preempt state (-?\d+)")
+# The ring the kernel blames. `cur rb` on the preempt line isn't it: that line prints before the kernel corrects it.
+_BLAMED = re.compile(r"\b(?:gpu fault ring|lockup rb) (-?\d+)")
 
 
-def _kernel_says(line: str, found: dict) -> None:
-    if m := _PREEMPT.search(line):
-        found.setdefault("ring", int(m[1]))
-        found.setdefault("preempt_state", int(m[2]))
-    elif m := _LOCKUP.search(line):
-        found.setdefault("ring", int(m[1]))
+def _kernel_says(line: str, said: dict[str, set[int]]) -> None:
+    for field, pattern in (("ring", _BLAMED), ("preempt_state", _PREEMPT)):
+        if (m := pattern.search(line)) and (value := int(m[1])) >= 0:
+            said.setdefault(field, set()).add(value)
 
 
-def parse_dump(path: Path) -> dict:
-    """What a devcoredump says about itself. A field it doesn't have stays out, never a guess."""
-    header, registers, found = {}, {}, {}
+def _seconds(text: str) -> float | None:
+    """Seconds since the epoch, or None if a date can't be made of them: not a number, nan, inf, 1e30."""
+    try:
+        seconds = float(text)
+        wslib.utc(seconds)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return seconds
+
+
+def parse_dump(path: Path) -> tuple[dict, dict[str, set[int]]]:
+    """What a devcoredump says about itself, and the kernel's lines in it. A field it doesn't have stays out, never a guess."""
+    header, registers, found, said = {}, {}, {}, {}
     in_registers = False
     with open(path, errors="replace") as f:
         for line in f:
@@ -81,34 +95,30 @@ def parse_dump(path: Path) -> dict:
             elif in_registers and (m := _REGISTER.match(line)):
                 registers.setdefault(int(m[1], 16) // 4, int(m[2], 16))
             elif len(line) < 500:  # not an encoded buffer
-                _kernel_says(line, found)
-    if "rbbm-status" in header:
+                _kernel_says(line, said)
+    if _HEX.fullmatch(header.get("rbbm-status", "")):
         found["rbbm_status"] = f"0x{int(header['rbbm-status'], 16):08x}"
     if header.get("revision", "").startswith("5"):
         for key, register in (("ib1_rem", A5XX_CP_IB1_BUFSZ), ("ib2_rem", A5XX_CP_IB2_BUFSZ)):
             if register in registers:
                 found[key] = f"0x{registers[register]:x}"
     for key, into in (("kernel", "kernel"), ("comm", "app"), ("cmdline", "cmdline"), ("revision", "revision")):
-        if key in header:
+        if header.get(key, "").strip():
             found[into] = header[key]
-    try:
-        found["time"] = float(header["time"])
-    except (KeyError, ValueError):
-        pass
-    return found
+    if (seconds := _seconds(header.get("time", ""))) is not None:
+        found["time"] = seconds
+    return found, said
 
 
 def _when(text: str | None) -> float | None:
     """A time given by hand: seconds since the epoch, or ISO 8601."""
     if not text:
         return None
-    try:
-        return float(text)
-    except ValueError:
-        pass
+    if (seconds := _seconds(text)) is not None:
+        return seconds
     try:
         return datetime.fromisoformat(text).timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         raise ToolError(f"not a time: {text}") from None
 
 
@@ -126,30 +136,46 @@ def _event_for(a, record: dict, own_id: str) -> str:
         if other.get("dump", {}).get("kind") != "gpu":
             raise ToolError(f"{a.event_with} isn't a GPU dump")
         return other["dump"]["event"]
-    if record["time_from"] != "file date":
-        for other in _gpu_dumps():
-            d = other["dump"]
-            if (other["id"] != own_id and d["time_from"] != "file date" and d.get("kernel") == record.get("kernel")
-                    and abs(d["time"] - record["time"]) <= EVENT_WINDOW):
-                return d["event"]
-    return own_id
+    if record["time_from"] == "file date" or not record.get("kernel"):
+        return own_id
+    events: dict[str, list[dict]] = {}
+    for other in _gpu_dumps():
+        if other["id"] != own_id:
+            events.setdefault(other["dump"]["event"], []).append(other["dump"])
+    # A false link is worse than a missed one: nothing undoes it, and --event-with can always add one. So every dump of
+    # an event has a date and this kernel, and the whole event stays within the window: no chains, whatever the add order.
+    fits = []
+    for event, members in events.items():
+        times = [record["time"], *(d["time"] for d in members)]
+        if (max(times) - min(times) <= EVENT_WINDOW
+                and all(d["time_from"] != "file date" and d.get("kernel") == record["kernel"] for d in members)):
+            fits.append((min(abs(d["time"] - record["time"]) for d in members), event))
+    return min(fits)[1] if fits else own_id
+
+
+def _live(name: str) -> dict | None:
+    return next((e for _, e in artstore.everything() if e["name"] == name and not e.get("tombstone")), None)
 
 
 def add_gpu(a) -> int:
-    if not a.file.is_file():
-        raise ToolError(f"not a file: {a.file}")
-    found = parse_dump(a.file)
+    # All of it before the log is stored: a log with no dump would stay, kept as long as the dump would have been.
+    artstore.check_keep(a.keep)
+    artstore.check_source(a.file, a.in_place)
+    if a.log:
+        artstore.check_source(a.log)
+    own_id = artstore.digest(a.file)[:artstore.ID_LENGTH]
+    if stored := _live(f"gpu-{own_id}"):
+        print(f"{stored['id']}: already stored, {a.file} stays where it is. Its record stands: --log and the flags weren't applied")
+        return 0
+    found, said = parse_dump(a.file)
     logged = None
     if a.log:
-        if not a.log.is_file():
-            raise ToolError(f"not a file: {a.log}")
-        said: dict = {}
         with open(a.log, errors="replace") as f:
             for line in f:
                 _kernel_says(line, said)
-        found = {**said, **found}
         logged = f"log-{artstore.digest(a.log)[:artstore.ID_LENGTH]}"
-    own_id = artstore.digest(a.file)[:artstore.ID_LENGTH]
+    # Nothing ties a log line to this dump: a log can hold two faults. One value can be believed, two can't.
+    found.update({field: next(iter(values)) for field, values in said.items() if len(values) == 1})
     record = {"kind": "gpu", **found, "ran": a.ran, "mesa": a.mesa, "profile": a.profile}
     for key, value in (("app", a.app), ("kernel", a.kernel), ("ring", a.ring), ("preempt_state", a.preempt_state),
                        ("shader_hash_candidate", a.shader_hash)):
@@ -159,51 +185,78 @@ def add_gpu(a) -> int:
     record["time_from"] = "flag" if given is not None else "dump" if "time" in record else "file date"
     record["time"] = given if given is not None else record.get("time", a.file.stat().st_mtime)
     record["event"] = _event_for(a, record, own_id)
+    made = wslib.utc(record["time"])
+    log_is_new = False
     if logged:
         record["log"] = logged
-        artstore.add(a.log, "dumps", name=logged, cls="user-data", what=f"kernel log around GPU fault {own_id}",
-                     keep=a.keep, by=a.by, copy=True, extra={"dump": {"kind": "gpu-log"}})
-    missing = [k for k in ("rbbm_status", "ib1_rem", "ring", "preempt_state") if k not in record]
+        _, log_is_new = artstore.add(a.log, "dumps", name=logged, cls="user-data", what="kernel log around a GPU fault",
+                                     keep=a.keep, by=a.by, copy=True, extra={"dump": {"kind": "gpu-log"}})
+    missing = [k for k in ("rbbm_status", "ib1_rem", "ring", "preempt_state") if k not in record and k not in said]
     what = f"GPU fault: {record.get('app', 'unknown app')} on {record.get('kernel', 'unknown kernel')}"
-    entry, new = artstore.add(a.file, "dumps", name=f"gpu-{own_id}", cls="user-data", what=what, keep=a.keep, by=a.by,
-                              sources=[logged] if logged else [], made=wslib.utc(record["time"]), in_place=a.in_place,
-                              copy=a.copy, extra={"dump": record})
-    if not new:
-        print(f"{entry['id']}: already stored, {a.file} stays where it is")
-        return 0
+    try:
+        entry, _ = artstore.add(a.file, "dumps", name=f"gpu-{own_id}", cls="user-data", what=what, keep=a.keep, by=a.by,
+                                sources=[logged] if logged else [], made=made, in_place=a.in_place, copy=a.copy,
+                                extra={"dump": record})
+    except (ToolError, OSError):
+        if log_is_new:
+            print(f"the log was stored as {logged}, but the dump wasn't: nothing refers to that log", file=sys.stderr)
+        raise
     print(entry["id"])
     if record["event"] != own_id:
         print(f"linked as one event with {record['event']}")
     if missing:
         print(f"not in the dump or log, so unknown in its fingerprint: {', '.join(missing)}", file=sys.stderr)
+    for field, values in said.items():
+        if field not in record:
+            print(f"the dump and log give more than one {field} ({', '.join(map(str, sorted(values)))}), so it's unknown "
+                  f"in its fingerprint: --{field.replace('_', '-')} says which", file=sys.stderr)
     return 0
 
 
 def add_ram(a) -> int:
-    artstore.check_keep(a.until)
+    until = artstore.check_keep(a.until)
     for path in (*a.images, a.kernel_log):
         if path.is_symlink() or not path.is_file():
             raise ToolError(f"not a regular file: {path}")
-        artstore.check_name(path.name)
+    for image in a.images:  # the log's own name is never used: it's stored as ram-ID-kernel.log
+        artstore.check_name(image.name)
+    named = [path.resolve() for path in (*a.images, a.kernel_log)]
+    if len(set(named)) != len(named):
+        raise ToolError("a file is named twice: each image and the kernel log are stored once, and moved")
     if a.kernel_log.stat().st_size == 0:
         raise ToolError(f"{a.kernel_log} is empty: a RAM dump's kernel log is the part that's always kept")
     _, build = artstore.resolve(a.build)  # first, so nothing moves if it's unknown
     given = _when(a.time)
     made = wslib.utc(given) if given is not None else None
     log_id = artstore.digest(a.kernel_log)[:artstore.ID_LENGTH]
+    log_name = f"ram-{log_id}-kernel.log"
+    images = [(image, f"ram-{artstore.digest(image)[:artstore.ID_LENGTH]}-{image.name}") for image in a.images]
+    # What's stored stands: asking for another date or build is refused here, or it would look as if it had worked.
+    if (stored := _live(log_name)) and stored["dump"]["build"] != build["name"]:
+        raise ToolError(f"{log_name} is already stored with build {stored['dump']['build']}, not {build['name']}: nothing was changed")
+    for _, name in images:
+        if (stored := _live(name)) and (stored["keep"], stored["dump"]["build"], stored["dump"]["log"]) != (until, build["name"], log_name):
+            raise ToolError(f"{name} is already stored, kept until {stored['keep']} with build {stored['dump']['build']} and log "
+                            f"{stored['dump']['log']}, and add-ram can't change those: nothing was changed")
     common = {"kernel": a.kernel, "ran": a.ran, "build": build["name"], "event": log_id, "time": given}
-    log, _ = artstore.add(a.kernel_log, "dumps", name=f"ram-{log_id}-kernel.log", cls="user-data",
-                          what=f"kernel log of a RAM dump, build {build['name']}", keep="always", by=a.by,
-                          sources=[build["name"]], made=made, in_place=a.in_place, copy=a.copy,
-                          extra={"dump": {"kind": "ram-log", **common}})
-    print(f"{log['id']} {log['name']}: kept always")
-    for image in a.images:
-        sha = artstore.digest(image)[:artstore.ID_LENGTH]
-        entry, _ = artstore.add(image, "dumps", name=f"ram-{sha}-{image.name}", cls="user-data",
-                                what=f"raw RAM dump image {image.name}, build {build['name']}", keep=a.until, by=a.by,
-                                sources=[build["name"], log["name"]], made=made, in_place=a.in_place, copy=a.copy,
-                                extra={"dump": {"kind": "ram", **common, "log": log["name"]}})
-        print(f"{entry['id']} {entry['name']}: kept until {a.until}")
+    log, new = artstore.add(a.kernel_log, "dumps", name=log_name, cls="user-data",
+                            what=f"kernel log of a RAM dump, build {build['name']}", keep="always", by=a.by,
+                            sources=[build["name"]], made=made, in_place=a.in_place, copy=a.copy,
+                            extra={"dump": {"kind": "ram-log", **common}})
+    print(f"{log['id']} {log['name']}: kept always" + ("" if new else f", already stored, {a.kernel_log} stays where it is"))
+    done = [log["name"]]
+    for image, name in images:
+        try:
+            entry, new = artstore.add(image, "dumps", name=name, cls="user-data",
+                                      what=f"raw RAM dump image {image.name}, build {build['name']}", keep=until, by=a.by,
+                                      sources=[build["name"], log["name"]], made=made, in_place=a.in_place, copy=a.copy,
+                                      extra={"dump": {"kind": "ram", **common, "log": log["name"]}})
+        except (ToolError, OSError):
+            print(f"stopped at {image}. Already stored: {', '.join(done)}. To finish, name only what's left, with "
+                  f"--kernel-log \"$(art path {log['name']})\"", file=sys.stderr)
+            raise
+        done.append(entry["name"])
+        print(f"{entry['id']} {entry['name']}: kept until {entry['keep']}" + ("" if new else f", already stored, {image} stays where it is"))
     return 0
 
 
@@ -226,13 +279,21 @@ def _decoder(name: str) -> tuple[Path, str | None]:
     return Path(done.stdout.strip()), artstore.resolve(name)[1].get("decoder", {}).get("image")
 
 
+def _read_only(source: Path, target: str) -> str:
+    """A --mount value. Not -v, which splits on ":". --mount is CSV, so a comma in a path has to be quoted."""
+    field = io.StringIO()
+    csv.writer(field, lineterminator="").writerow(["type=bind", f"source={source}", f"target={target}", "readonly"])
+    return field.getvalue()
+
+
 def decode_command(dump: Path, decoder: Path, image: str | None, verbose: bool) -> list[str]:
     flags = ["-v"] if verbose else []
     if not image:
         return [str(decoder), *flags, "-f", str(dump)]
-    # No network: a dump holds GPU memory from your apps. Mounted read-only, run as the files' owner.
-    return ["docker", "run", "--rm", "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}",
-            "-v", f"{dump}:/dump:ro", "-v", f"{decoder}:/usr/local/bin/crashdec:ro", image,
+    # No network: a dump holds GPU memory from your apps. Mounted read-only, run as the files' owner. No log driver:
+    # a daemon set to journald or syslog would otherwise keep the decoded output. Attached stdout still comes through.
+    return ["docker", "run", "--rm", "--network", "none", "--log-driver", "none", "--user", f"{os.getuid()}:{os.getgid()}",
+            "--mount", _read_only(dump, "/dump"), "--mount", _read_only(decoder, "/usr/local/bin/crashdec"), image,
             "crashdec", *flags, "-f", "/dump"]
 
 

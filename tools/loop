@@ -48,6 +48,8 @@ loop/<name>/loop.toml, one per binary. The commands in it are shell on the devic
   [restart]
   stop = "..."                      returns once told; loop then waits for the process to go
   start = "..."                     run with the session's own environment
+                                    A script used as stop or start should exec its daemon: a signal reaches only the
+                                    command loop ran, not what it started. Neither may read stdin
   reexec = "..."                    if it can re-execute itself, up uses that, and no windows close
   environment_from = "NAME"         the process whose environment start gets: the binary itself by default
                                     Saved from /proc before anything stops, in the override's folder (0700, the file 0600),
@@ -58,6 +60,8 @@ loop/<name>/loop.toml, one per binary. The commands in it are shell on the devic
 
   [live]
   reapply = '...'                   sets one value, given as $name and $value, after each restart
+                                    Quote them: "$name" and "$value" (an unquoted one splits and globs). It runs under
+                                    timeout 5 with no stdin
 
   [config]
   path = "/etc/NAME.conf"           KEY=VALUE lines. Only loop writes it: in place, so inode and mode stay

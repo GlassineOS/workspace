@@ -1045,6 +1045,11 @@ def test_help_and_claude_md_say_the_lints_are_text_matches():
         assert "script a recipe calls" in text or "scripts a recipe calls" in text
 
 
+def test_help_says_stop_and_start_exec_their_daemon_and_reapply_quotes_its_values():
+    text = (TOOLS / "loop").read_text()
+    assert "should exec its daemon" in text and 'Quote them: "$name" and "$value"' in text
+
+
 def test_a_copy_over_a_bind_whose_record_was_lost_keeps_the_folder_and_its_restore(lp):
     lp.recipe()
     lp.take("a")

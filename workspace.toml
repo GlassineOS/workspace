@@ -34,3 +34,27 @@ url = "git@github.com:GlassineOS/android_device_onyx_noteair.git"
 
 [repo."android_bootable_recovery"]
 url = "git@github.com:GlassineOS/android_bootable_recovery.git"
+
+[repo."epd"]
+url = "git@github.com:GlassineOS/epd.git"
+
+[repo."shell"]
+url = "git@github.com:GlassineOS/shell.git"
+
+[repo."wvkbd"]
+url = "git@github.com:GlassineOS/wvkbd.git"
+
+[repo."protocols"]
+url = "git@github.com:GlassineOS/protocols.git"
+
+[repo."images"]
+url = "git@github.com:GlassineOS/images.git"
+
+[repo."bootstrap-onyx-noteair"]
+url = "git@github.com:GlassineOS/bootstrap-onyx-noteair.git"
+
+[repo."sway"]
+url = "git@github.com:GlassineOS/sway.git"
+
+[repo."rnote"]
+url = "git@github.com:GlassineOS/rnote.git"

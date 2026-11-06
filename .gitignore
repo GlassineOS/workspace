@@ -1,6 +1,7 @@
 # Everything here is someone else's repository or a task's worktree, unless named below.
 /*
 !/.github/
+!/bench/
 !/.gitignore
 !/.gitmodules
 !/.glassine/
@@ -8,6 +9,8 @@
 !/LICENSE
 !/Makefile
 !/README.md
+!/loop/
+!/repro/
 !/tests/
 !/tools/
 !/workspace.toml

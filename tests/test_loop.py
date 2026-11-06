@@ -1023,3 +1023,23 @@ def test_the_override_folder_and_the_saved_environment_are_private(lp):
 def test_help_says_the_environment_values_are_briefly_in_argv():
     text = (TOOLS / "loop").read_text()
     assert "argv" in text and "/proc/*/cmdline" in text
+
+
+@pytest.mark.parametrize("command", ["sed -i s/a/b/ f", "sed -Ei s/a/b/ f", "sed -ni s/a/b/p f", "sed --in-place s/a/b/ f",
+                                     "sed --in-place=.bak s/a/b/ f", "sed -i.bak s/a/b/ f", "sed -e x -i f", "sed -n -e 'a;b' -i f",
+                                     "echo hi; sed -E -i s/a/b/ f"])
+def test_every_way_of_saying_sed_in_place_is_refused(lp, command):
+    lp.recipe(restart=f'reexec = "{command}"')
+    assert "sed -i" in lp.loop("check", code=1).stderr
+
+
+@pytest.mark.parametrize("command", ["sed -n p f", "sed -E s/a/b/ f", "sed -e 's/a/-i/' f", "sed s/a/b/ f; ls -i", "sed -n 's/a/b/p' f | wc -l"])
+def test_sed_that_edits_nothing_in_place_is_fine(lp, command):
+    lp.recipe(restart=f'reexec = "{command}"')
+    assert "sound" in lp.loop("check").stdout
+
+
+def test_help_and_claude_md_say_the_lints_are_text_matches():
+    for text in ((TOOLS / "loop").read_text(), (TOOLS.parent / "CLAUDE.md").read_text()):
+        assert "text match" in text
+        assert "script a recipe calls" in text or "scripts a recipe calls" in text

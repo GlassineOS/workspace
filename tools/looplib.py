@@ -91,8 +91,22 @@ def seconds_of(table: dict, key: str, default: int, where: str) -> int:
     return value
 
 
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+_SED = re.compile(r"(?<![\w-])sed(?![\w-])([^;|&\n]*)")
+_IN_PLACE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*i|--in-place)")
+
+
+def edits_in_place(text: str) -> bool:
+    """A sed with -i in any option cluster (-Ei, -ni, -i.bak) or --in-place, anywhere in its own command. A text match:
+    quoted strings are blanked first, so a script such as 's/a/-i/' doesn't count, and nothing is read through a variable."""
+    return any(_IN_PLACE.search(m[1]) for m in _SED.finditer(_QUOTED.sub("Q", text)))
+
+
 def check_shell(text: str, key: str, role: str, config: str | None, where: str) -> None:
-    """What a recipe's own commands may not do. The tool does the unmount and the config write itself."""
+    """What a recipe's own commands may not do. The tool does the unmount and the config write itself.
+
+    These are text matches on the strings in the recipe, a lint and not a guard: they don't look inside a script the recipe
+    calls, the kill check is for role = "daemon" only, and the config check is the file's exact path as a substring."""
     if _UNMOUNT.search(text):
         raise ToolError(f"{where}: {key} unmounts. loop does that itself, after the process stops, and never lazily")
     if role == "daemon" and _KILLS.search(text):
@@ -101,7 +115,7 @@ def check_shell(text: str, key: str, role: str, config: str | None, where: str) 
         raise ToolError(f"{where}: {key} reads or globs /run on the device, whose control FIFO blocks. Writing to it is fine")
     if config and config in text:
         raise ToolError(f"{where}: {key} touches the config file. loop writes it in place itself, keeping its inode and mode")
-    if re.search(r"(?<![\w-])sed\s+(-\w+\s+)*-i", text):
+    if edits_in_place(text):
         raise ToolError(f"{where}: {key} uses sed -i, which replaces a file's inode")
 
 

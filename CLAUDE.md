@@ -84,9 +84,11 @@ tools/loop up NAME --as NAME; tools/loop restore NAME --as NAME  # the same in t
   from your apps: don't save them in a checkout. The scan only catches patterns, so tools write results to the right
   place themselves. Our own measured numbers may stay in a comment or commit message where they justify a default.
 - **Don't bind by hand, use `loop`:** the hazards are in the tool. It stops a process before unmounting and never unmounts
-  lazily, reapplies live values from `overrides.d`, never kills the daemon by hand, keeps the config file's inode and
-  mode, and a restart of the compositor closes every app window, so it needs a go. Reboot is the rollback. It joins your
-  take and never releases it. Recipes aren't tried on a device until someone with a go has run them.
+  lazily, reapplies live values from `overrides.d`, keeps the config file's inode and mode, and a restart of the compositor
+  closes every app window, so it needs a go. Reboot is the rollback. It joins your take and never releases it. What it
+  generates holds those; the checks on a recipe's own commands (no kill of a daemon, no `sed -i`, not the config file) are
+  text matches that don't look inside a script a recipe calls, so read what a `stop` or `start` runs. Recipes aren't tried
+  on a device until someone with a go has run them.
 - **Notes say where each claim comes from:** `seen` (a base and a command or artifact), `inferred` (from which
   claims), `guess`, `user` or `archive`. Current takes only `seen`, `user` and `inferred` resting on Current, so a
   guess can't rise by being repeated. Nothing is deleted: what's replaced or retracted goes to Log, marked. `add` and

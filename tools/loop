@@ -18,6 +18,11 @@ Each step: build for arm64 on this host, copy to a folder on writable storage wi
 live binary, record it in overrides.d, restart or re-execute, check what's running is the copy, reapply live values.
 Reboot is the rollback. --next-restart leaves it bound and marks the record, when a restore would close your windows.
 
+The checks on a recipe's commands (no umount, no kill of a daemon, no sed -i, no config path, no reading /run) are
+text matches on the strings in loop.toml. They don't look inside a script a recipe calls: a stop of /root/stop.sh
+isn't checked at all. The kill check is for role = "daemon" only, and the config check is the exact path as a
+substring. They catch a slip. What a called script does is for whoever writes and reviews it.
+
 loop/<name>/loop.toml, one per binary. The commands in it are shell on the device:
 
   what = "one line"

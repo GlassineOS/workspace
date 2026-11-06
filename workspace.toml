@@ -41,6 +41,12 @@ url = "git@github.com:GlassineOS/epd.git"
 [repo."shell"]
 url = "git@github.com:GlassineOS/shell.git"
 
+[repo."ui"]
+url = "git@github.com:GlassineOS/ui.git"
+
+[repo."home"]
+url = "git@github.com:GlassineOS/home.git"
+
 [repo."wvkbd"]
 url = "git@github.com:GlassineOS/wvkbd.git"
 

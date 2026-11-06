@@ -212,7 +212,10 @@ def build(r, folder: Path) -> Path:
 def copy(device, r, binary: Path, sha: str) -> None:
     """Text through dev's one seam. The hash on the device decides."""
     folder = shlex.quote(r.folder)
-    device.do(f"rm -rf {folder} && (umask 077; mkdir -p {folder}) && : > {folder}/binary")
+    # a folder with a bind on its binary is not deleted, even if its record is lost: its restore.sh is how to undo it
+    bound = looplib.is_bound(r, device.probe_command("binds"))
+    refused = looplib.fail(f"{r.target} is already bound: restore it first. {r.folder} is left as it is", 20)
+    device.do(f"if {bound}; then {refused}; fi\nrm -rf {folder} && (umask 077; mkdir -p {folder}) && : > {folder}/binary")
     with open(binary, "rb") as f:
         while chunk := f.read(CHUNK):
             text = base64.encodebytes(chunk).decode()

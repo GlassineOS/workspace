@@ -1043,3 +1043,17 @@ def test_help_and_claude_md_say_the_lints_are_text_matches():
     for text in ((TOOLS / "loop").read_text(), (TOOLS.parent / "CLAUDE.md").read_text()):
         assert "text match" in text
         assert "script a recipe calls" in text or "scripts a recipe calls" in text
+
+
+def test_a_copy_over_a_bind_whose_record_was_lost_keeps_the_folder_and_its_restore(lp):
+    lp.recipe()
+    lp.take("a")
+    lp.loop("up", "widgetd", "--as", "a")
+    folder = lp.storage / "loop-widgetd"
+    script, inode = (folder / "restore.sh").read_text(), (folder / "binary").stat().st_ino
+    (lp.device.store / "overrides.d" / "loop-widgetd").unlink()  # the record is gone, the bind isn't
+    lp.recipe(content="another build\n")
+    done = lp.loop("up", "widgetd", "--as", "a", "--dirty", "a lost record", code=1)
+    assert "already bound" in done.stderr
+    assert lp.bound() and (folder / "binary").stat().st_ino == inode  # the file the bind sits on wasn't deleted
+    assert (folder / "binary").read_text() == "a new build\n" and (folder / "restore.sh").read_text() == script

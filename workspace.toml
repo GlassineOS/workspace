@@ -53,9 +53,9 @@ url = "git@github.com:GlassineOS/images.git"
 [repo."bootstrap-onyx-noteair"]
 url = "git@github.com:GlassineOS/bootstrap-onyx-noteair.git"
 
-# Private: ws sync stops at the first clone that fails, so these come last.
 [repo."sway"]
 url = "git@github.com:GlassineOS/sway.git"
 
+# Private: ws sync stops at the first clone that fails, so it comes last.
 [repo."rnote"]
 url = "git@github.com:GlassineOS/rnote.git"

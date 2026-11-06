@@ -314,6 +314,27 @@ def test_a_private_input_thats_here_runs_and_is_named_by_id(kit):
     assert kit.results()[0]["from"] == [ident]
 
 
+def test_a_private_input_by_its_whole_sha256_runs_too(kit):
+    stream = kit.tmp / "stream"
+    stream.write_text("captured\n")
+    sha = artstore.digest(stream)  # art add moves the file
+    kit.tool("art", "add", stream, "--to", "captures", "--class", "user-data", "--what", "a stream", "--keep", "user")
+    kit.define("private", f"""\
+        what = "from a captured stream"
+        [source]
+        artifact = "{sha}"
+        [run]
+        where = "host"
+        command = ["cat", "{{source}}"]
+        timeout = "1m"
+        [pass]
+        output_has = "captured"
+        """)
+    kit.repro("check")
+    kit.repro("run", "private", "--as", "a")
+    assert kit.record(kit.results()[0])["result"] == "pass"
+
+
 def test_a_private_input_changed_on_disk_is_refused(kit):
     stream = kit.tmp / "stream"
     stream.write_text("captured\n")
@@ -432,6 +453,7 @@ def test_gate_with_a_patch_list_file(kit):
     ('what="x"\n[run]\nwhere="device"\ntimeout="1m"', "needs [source]"),
     ('what="x"\n[source]\nfile="r"\nartifact="0123456789ab"\n[run]\nwhere="device"\ntimeout="1m"', "one of"),
     ('what="x"\n[source]\nartifact="a-private-name"\n[run]\nwhere="device"\ntimeout="1m"', "goes by id"),
+    ('what="x"\n[source]\nartifact="0123456789abcdef"\n[run]\nwhere="device"\ntimeout="1m"', "goes by id"),  # a prefix resolve doesn't match
     ('what="x"\n[source]\nfile="../up"\n[run]\nwhere="device"\ntimeout="1m"', "inside"),
     ('what="x"\n[source]\nfile="r"\n[run]\nwhere="device"', "every run is bounded"),
     ('what="x"\n[source]\nfile="r"\n[run]\nwhere="moon"\ntimeout="1m"', "where is"),

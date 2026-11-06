@@ -28,7 +28,7 @@ from wslib import ToolError
 
 TOOLS = Path(__file__).resolve().parent
 SKIPPED = 77  # never 0: a skip chained with && must not read as a pass
-_ARTIFACT_ID = re.compile(rf"[0-9a-f]{{{artstore.ID_LENGTH},64}}")
+_ARTIFACT_ID = re.compile(rf"[0-9a-f]{{{artstore.ID_LENGTH}}}|[0-9a-f]{{64}}")  # what artstore.resolve matches: the id or the whole sha256
 _ACTION = re.compile(r"[a-z0-9][a-z0-9-]*")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _WRITE_TARGET = re.compile(r">>?\s*(\"[^\"]*\"|'[^']*'|[^\s;|&]+)")
@@ -120,7 +120,7 @@ def check_source(table: dict, where: str) -> dict:
     if len(source) != 1:
         raise ToolError(f"{where}: [source] is one of file or artifact")
     if "artifact" in source and not _ARTIFACT_ID.fullmatch(str(source["artifact"])):
-        raise ToolError(f"{where}: [source] artifact is an id, the start of its sha256: a private input goes by id")
+        raise ToolError(f"{where}: [source] artifact is an id ({artstore.ID_LENGTH} hex characters) or a whole sha256: a private input goes by id")
     if "file" in source and (Path(source["file"]).is_absolute() or ".." in Path(source["file"]).parts):
         raise ToolError(f"{where}: [source] file is inside the definition's folder")
     return source

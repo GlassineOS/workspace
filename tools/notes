@@ -8,6 +8,9 @@
   notes set AREA/TOPIC --retract cN --by cM --why WORDS mark it retracted; it moves to Log, what rests
                                                         on it leaves Current with it
   notes set AREA/TOPIC --close cN --why WORDS           an Open item that's settled goes to Log
+  notes set AREA/TOPIC --delete cN [--by cM] --why WORDS
+                                                        take a claim out, text and all; what rests on it
+                                                        leaves Current with it
   notes lint [AREA/TOPIC...]                            what may not stand; exit 1 if anything
   notes find WORDS... [--limit N] [--json]              search notes and the configured sources
 
@@ -15,8 +18,8 @@ PROVENANCE: --seen "base=ID, art=NAME" or --seen "base=ID, cmd=WORDS", --inferre
 --user, --archive [SOURCE]. A Log line may have none.
 
 Current takes only seen with evidence, user, and inferred resting on a Current claim, so a guess or
-an archive claim stays in Open or Log. Nothing is deleted: what's replaced, retracted or closed goes
-to Log, marked.
+an archive claim stays in Open or Log. What's replaced, retracted or closed goes to Log, marked. What's
+deleted leaves only its id, the date and why in Log; the notes' git history keeps its text.
 
 add and set take a lock around edit, lint, the safety scan and commit, and refuse the whole write on
 a problem. A pre-commit hook gives hand edits the same scan and lint. The scan catches patterns, not
@@ -84,17 +87,18 @@ def add(a) -> int:
 
 def set_(a) -> int:
     said = []
-    if a.retract and a.close:
-        raise wslib.ToolError("--retract and --close are two writes: one at a time")
-    if a.retract or a.close:
-        flag = "--retract" if a.retract else "--close"
+    if sum(bool(flag) for flag in (a.retract, a.close, a.delete)) > 1:
+        raise wslib.ToolError("--retract, --close and --delete are separate writes: one at a time")
+    if a.retract or a.close or a.delete:
+        flag = "--retract" if a.retract else "--close" if a.close else "--delete"
         extra = [name for name, given in (("words", a.words), ("provenance", tag(a)), ("--replaces", a.replaces),
                                           ("--open", a.open)) if given]
         if extra or (a.close and a.by):
-            raise wslib.ToolError(f"{flag} takes {'--by and --why' if a.retract else '--why'} only, and "
+            raise wslib.ToolError(f"{flag} takes {'--why' if a.close else '--by and --why'} only, and "
                                   f"{', '.join(extra) or '--by'} would be dropped, so nothing was written")
     elif a.by or a.why:
-        raise wslib.ToolError("--by and --why go with --retract or --close, and would be dropped, so nothing was written")
+        raise wslib.ToolError("--by and --why go with --retract, --close or --delete, and would be dropped, so nothing "
+                              "was written")
 
     def edit(text: str) -> str:
         if a.retract:
@@ -102,6 +106,11 @@ def set_(a) -> int:
                 raise wslib.ToolError("--retract needs --by cN, the claim that shows it wrong, and --why WORDS")
             new, out = noteslib.retract(text, a.retract, a.by, one_line(a.why))
             said.append(f"{a.topic} {a.retract} retracted")
+        elif a.delete:
+            if not a.why:
+                raise wslib.ToolError("--delete needs --why WORDS")
+            new, out = noteslib.delete(text, a.delete, one_line(a.why), a.by)
+            said.append(f"{a.topic} {a.delete} deleted")
         elif a.close:
             if not a.why:
                 raise wslib.ToolError("--close needs --why WORDS")
@@ -169,6 +178,7 @@ def main(argv=None) -> int:
     s.add_argument("--replaces", metavar="ID")
     s.add_argument("--retract", metavar="ID")
     s.add_argument("--close", metavar="ID")
+    s.add_argument("--delete", metavar="ID")
     s.add_argument("--by", metavar="ID")
     s.add_argument("--why")
     provenance(s)

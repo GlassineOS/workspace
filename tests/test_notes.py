@@ -384,7 +384,7 @@ def test_a_note_in_the_wrong_place_is_a_problem(nb):
     assert "AREA/TOPIC" in nb.run("lint", code=1).stdout
 
 
-# Replacing, retracting, closing: nothing is deleted
+# Replacing, retracting, closing: the text stays, in Log
 
 
 def test_replace_stays_in_place_and_keeps_the_old_words_in_the_log(nb):
@@ -463,6 +463,9 @@ def test_retract_and_close_refuse(nb, args, words):
     (("--seen", EVIDENCE, "--retract", "c1", "--by", "c3", "--why", "x"), "provenance"),
     (("--open", "--retract", "c1", "--by", "c3", "--why", "x"), "--open"),
     (("--retract", "c1", "--close", "c2", "--by", "c3", "--why", "x"), "one at a time"),
+    (("--delete", "c1", "--close", "c2", "--why", "x"), "one at a time"),
+    (("--delete", "c1", "--by", "c3", "--close", "c2", "--why", "x"), "one at a time"),
+    (("--seen", EVIDENCE, "--delete", "c1", "--why", "x"), "provenance"),
     (("the answer", "--user", "--why", "settled"), "--by and --why go with"),
     (("the answer", "--user", "--by", "c1"), "--by and --why go with"),
 ])
@@ -550,6 +553,142 @@ def test_hand_wrapped_claims_are_moved_whole(nb):
     nb.set("--retract", "c1", "--by", "c2", "--why", "x")
     assert f"- c1 [user] first line second line RETRACTED {TODAY} by c2: x\n" in nb.section("Log")
     assert nb.section("Current") == "- c2 [user] other\n"
+
+
+# Deleting: the text goes, its id and why stay in Log
+
+
+def test_a_delete_takes_the_text_out_and_what_rests_on_it_out_of_current(nb):
+    nb.seen("Base")
+    nb.set("Direct", "--inferred", "c1")
+    nb.seen("Shows it wrong")
+    done = nb.set("--delete", "c1", "--by", "c3", "--why", "contradicted by the bench")
+    assert "a/t c1 deleted" in done.stdout and "out of Current with it: c2" in done.stdout
+    assert "Base" not in nb.text()
+    assert nb.section("Current") == f"- c3 [seen: {EVIDENCE}] Shows it wrong\n"
+    log = nb.section("Log")
+    assert f"- c1 DELETED {TODAY} by c3: contradicted by the bench\n" in log
+    assert f"- c2 [inferred: c1] Direct OUT {TODAY}: rested on c1.\n" in log
+    nb.run("lint")
+    assert "Base" in nb.git("log", "-p")  # the notes' own history keeps the text
+
+
+def test_the_maintainer_deletes_without_a_witness_and_the_id_never_comes_back(nb):
+    nb.seen("One")
+    nb.seen("Two")
+    nb.set("--delete", "c2", "--why", "wrong")
+    assert nb.seen("Three") == "c3"
+    nb.run("lint")
+
+
+@pytest.mark.parametrize("args, words", [
+    (("--delete", "c1"), "needs --why"),
+    (("--delete", "c9", "--why", "x"), "no claim c9"),
+    (("--delete", "c1", "--by", "c1", "--why", "x"), "can't show itself wrong"),
+    (("--delete", "c1", "--by", "c2", "--why", "x"), "rests on c1"),
+    (("--delete", "c1", "--retract", "c1", "--why", "x"), "one at a time"),
+    (("--delete", "c1", "words", "--why", "x"), "would be dropped"),
+])
+def test_delete_refuses(nb, args, words):
+    nb.seen("Fact")
+    nb.set("Rests", "--inferred", "c1")
+    before = nb.text()
+    assert words in nb.set(*args, code=1).stderr
+    assert nb.text() == before
+
+
+def test_the_tool_deletes_a_user_claim_without_a_witness_because_it_cant_tell_who_asks(nb):
+    """Pinned as it is today, not as a verdict: CLAUDE.md shows `--by cM`, and the tool takes it as optional.
+    Whether a session must name one, with the person's own way of leaving it out, is for the maintainer."""
+    nb.set("Said by the person", "--user")
+    nb.set("--delete", "c1", "--why", "wrong")
+    assert nb.section("Current") == ""
+    assert f"- c1 DELETED {TODAY}: wrong\n" in nb.section("Log")
+
+
+def test_lint_checks_the_claim_a_deleted_line_names(nb):
+    dangling = page(log=f"### {TODAY}\n- c1 DELETED {TODAY} by c99: hand\n")
+    assert [said for _, said in noteslib.lint(dangling)] == ["c1 was deleted by c99, and no claim here has that id"]
+    assert noteslib.lint(page("- c2 [user] x\n", log=f"### {TODAY}\n- c1 DELETED {TODAY} by c2: hand\n")) == []
+    assert any("belongs in Log" in said for _, said in noteslib.lint(page(f"- c1 DELETED {TODAY}: hand\n")))
+    nb.seen("Fact")
+    good = nb.text()
+    nb.hand_commit(good.replace("- c1 [", f"- c2 DELETED {TODAY}: x\n- c1 [", 1), code=1)  # in Current: the hook refuses it
+    day = f"### {TODAY}\n"
+    nb.hand_commit(good + day + f"- c2 DELETED {TODAY} by c99: hand\n", code=1)  # dangling by: the hook refuses it too
+    nb.hand_commit(good + day + f"- c2 DELETED {TODAY} by c1: hand\n")
+
+
+def test_a_claim_that_showed_another_wrong_cant_be_deleted_only_retracted(nb):
+    nb.seen("Wrong")
+    nb.seen("Shows it wrong")
+    nb.seen("Other")
+    nb.set("--retract", "c1", "--by", "c2", "--why", "bench")
+    nb.seen("Also wrong")
+    nb.set("--delete", "c4", "--by", "c3", "--why", "bench")
+    before = nb.text()
+    for witness in ("c2", "c3"):  # one retracted a claim, the other deleted one
+        said = nb.set("--delete", witness, "--why", "wrong too", code=1).stderr
+        assert f"retract {witness} instead" in said
+    assert nb.text() == before
+    nb.set("--retract", "c2", "--by", "c3", "--why", "wrong too")  # its words stay, so the reasons still read
+    nb.run("lint")
+
+
+def test_deleting_the_claim_that_was_retracted_drops_the_retraction_record_too(nb):
+    """Intended: a delete takes the claim out whatever state it's in, and its line says why."""
+    nb.seen("Wrong")
+    nb.seen("Shows it wrong")
+    nb.set("--retract", "c1", "--by", "c2", "--why", "bench")
+    nb.set("--delete", "c1", "--why", "should never have been written")
+    log = nb.section("Log")
+    assert f"- c1 DELETED {TODAY}: should never have been written\n" in log
+    assert "RETRACTED" not in log and "Wrong" not in nb.text()
+    nb.run("lint")
+    assert "c1 was deleted" in nb.set("--retract", "c2", "--by", "c1", "--why", "x", code=1).stderr
+
+
+def test_deleting_a_replacement_leaves_the_old_claim_replaced(nb):
+    """Intended, and pinned: the old claim keeps its REPLACED line, which now points at a DELETED one, and it
+    can't be replaced again. The topic has no current state until a new claim is made."""
+    nb.seen("Old")
+    nb.set("New", "--user", "--replaces", "c1")
+    nb.set("--delete", "c2", "--why", "the new one was wrong")
+    assert nb.section("Current") == ""
+    log = nb.section("Log")
+    assert f"REPLACED {TODAY} by c2." in log and f"- c2 DELETED {TODAY}: the new one was wrong\n" in log
+    nb.run("lint")
+    assert "already replaced, by c2" in nb.set("Newer", "--user", "--replaces", "c1", code=1).stderr
+    assert nb.set("Newer", "--user").stdout.split()[1] == "c3"
+
+
+def test_deleting_the_replaced_claim_leaves_its_replacement_alone(nb):
+    nb.seen("Old")
+    nb.set("New", "--user", "--replaces", "c1")
+    nb.set("--delete", "c1", "--why", "never was true")
+    assert nb.section("Current") == "- c2 [user] New\n"
+    assert f"- c1 DELETED {TODAY}: never was true\n" in nb.section("Log")
+    nb.run("lint")
+
+
+def test_deleting_an_open_claim_leaves_an_open_item_resting_on_it(nb):
+    """Intended, as for a retraction: only Current is held to resting on Current, and the id still resolves."""
+    nb.add("A theory", "--guess", "--open")
+    nb.add("Follows from it", "--inferred", "c1", "--open")
+    done = nb.set("--delete", "c1", "--why", "wrong question")
+    assert "out of Current" not in done.stdout
+    assert nb.section("Open") == "- c2 [inferred: c1] Follows from it\n"
+    assert f"- c1 DELETED {TODAY}: wrong question\n" in nb.section("Log")
+    nb.run("lint")
+
+
+def test_a_deleted_claim_cant_be_touched_again_nor_faked(nb):
+    nb.seen("Fact")
+    nb.seen("Other")
+    nb.set("--delete", "c1", "--why", "wrong")
+    assert "c1 was deleted" in nb.set("--delete", "c1", "--why", "again", code=1).stderr
+    assert "c1 was deleted" in nb.set("--retract", "c2", "--by", "c1", "--why", "x", code=1).stderr
+    assert "shape of a mark" in nb.add(f"c2 DELETED {TODAY}: gone", code=1).stderr
 
 
 # The scan

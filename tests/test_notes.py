@@ -463,6 +463,9 @@ def test_retract_and_close_refuse(nb, args, words):
     (("--seen", EVIDENCE, "--retract", "c1", "--by", "c3", "--why", "x"), "provenance"),
     (("--open", "--retract", "c1", "--by", "c3", "--why", "x"), "--open"),
     (("--retract", "c1", "--close", "c2", "--by", "c3", "--why", "x"), "one at a time"),
+    (("--delete", "c1", "--close", "c2", "--why", "x"), "one at a time"),
+    (("--delete", "c1", "--by", "c3", "--close", "c2", "--why", "x"), "one at a time"),
+    (("--seen", EVIDENCE, "--delete", "c1", "--why", "x"), "provenance"),
     (("the answer", "--user", "--why", "settled"), "--by and --why go with"),
     (("the answer", "--user", "--by", "c1"), "--by and --why go with"),
 ])

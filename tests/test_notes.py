@@ -623,6 +623,53 @@ def test_a_claim_that_showed_another_wrong_cant_be_deleted_only_retracted(nb):
     nb.run("lint")
 
 
+def test_deleting_the_claim_that_was_retracted_drops_the_retraction_record_too(nb):
+    """Intended: a delete takes the claim out whatever state it's in, and its line says why."""
+    nb.seen("Wrong")
+    nb.seen("Shows it wrong")
+    nb.set("--retract", "c1", "--by", "c2", "--why", "bench")
+    nb.set("--delete", "c1", "--why", "should never have been written")
+    log = nb.section("Log")
+    assert f"- c1 DELETED {TODAY}: should never have been written\n" in log
+    assert "RETRACTED" not in log and "Wrong" not in nb.text()
+    nb.run("lint")
+    assert "c1 was deleted" in nb.set("--retract", "c2", "--by", "c1", "--why", "x", code=1).stderr
+
+
+def test_deleting_a_replacement_leaves_the_old_claim_replaced(nb):
+    """Intended, and pinned: the old claim keeps its REPLACED line, which now points at a DELETED one, and it
+    can't be replaced again. The topic has no current state until a new claim is made."""
+    nb.seen("Old")
+    nb.set("New", "--user", "--replaces", "c1")
+    nb.set("--delete", "c2", "--why", "the new one was wrong")
+    assert nb.section("Current") == ""
+    log = nb.section("Log")
+    assert f"REPLACED {TODAY} by c2." in log and f"- c2 DELETED {TODAY}: the new one was wrong\n" in log
+    nb.run("lint")
+    assert "already replaced, by c2" in nb.set("Newer", "--user", "--replaces", "c1", code=1).stderr
+    assert nb.set("Newer", "--user").stdout.split()[1] == "c3"
+
+
+def test_deleting_the_replaced_claim_leaves_its_replacement_alone(nb):
+    nb.seen("Old")
+    nb.set("New", "--user", "--replaces", "c1")
+    nb.set("--delete", "c1", "--why", "never was true")
+    assert nb.section("Current") == "- c2 [user] New\n"
+    assert f"- c1 DELETED {TODAY}: never was true\n" in nb.section("Log")
+    nb.run("lint")
+
+
+def test_deleting_an_open_claim_leaves_an_open_item_resting_on_it(nb):
+    """Intended, as for a retraction: only Current is held to resting on Current, and the id still resolves."""
+    nb.add("A theory", "--guess", "--open")
+    nb.add("Follows from it", "--inferred", "c1", "--open")
+    done = nb.set("--delete", "c1", "--why", "wrong question")
+    assert "out of Current" not in done.stdout
+    assert nb.section("Open") == "- c2 [inferred: c1] Follows from it\n"
+    assert f"- c1 DELETED {TODAY}: wrong question\n" in nb.section("Log")
+    nb.run("lint")
+
+
 def test_a_deleted_claim_cant_be_touched_again_nor_faked(nb):
     nb.seen("Fact")
     nb.seen("Other")

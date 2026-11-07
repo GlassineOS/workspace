@@ -26,6 +26,9 @@ url = "git@github.com:GlassineOS/packages.git"
 [repo."boot"]
 url = "git@github.com:GlassineOS/boot.git"
 
+[repo."abl"]
+url = "git@github.com:GlassineOS/abl.git"
+
 [repo."linux"]
 url = "git@github.com:GlassineOS/linux.git"
 

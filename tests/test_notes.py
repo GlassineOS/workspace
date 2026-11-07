@@ -594,6 +594,35 @@ def test_delete_refuses(nb, args, words):
     assert nb.text() == before
 
 
+def test_lint_checks_the_claim_a_deleted_line_names(nb):
+    dangling = page(log=f"### {TODAY}\n- c1 DELETED {TODAY} by c99: hand\n")
+    assert [said for _, said in noteslib.lint(dangling)] == ["c1 was deleted by c99, and no claim here has that id"]
+    assert noteslib.lint(page("- c2 [user] x\n", log=f"### {TODAY}\n- c1 DELETED {TODAY} by c2: hand\n")) == []
+    assert any("belongs in Log" in said for _, said in noteslib.lint(page(f"- c1 DELETED {TODAY}: hand\n")))
+    nb.seen("Fact")
+    good = nb.text()
+    nb.hand_commit(good.replace("- c1 [", f"- c2 DELETED {TODAY}: x\n- c1 [", 1), code=1)  # in Current: the hook refuses it
+    day = f"### {TODAY}\n"
+    nb.hand_commit(good + day + f"- c2 DELETED {TODAY} by c99: hand\n", code=1)  # dangling by: the hook refuses it too
+    nb.hand_commit(good + day + f"- c2 DELETED {TODAY} by c1: hand\n")
+
+
+def test_a_claim_that_showed_another_wrong_cant_be_deleted_only_retracted(nb):
+    nb.seen("Wrong")
+    nb.seen("Shows it wrong")
+    nb.seen("Other")
+    nb.set("--retract", "c1", "--by", "c2", "--why", "bench")
+    nb.seen("Also wrong")
+    nb.set("--delete", "c4", "--by", "c3", "--why", "bench")
+    before = nb.text()
+    for witness in ("c2", "c3"):  # one retracted a claim, the other deleted one
+        said = nb.set("--delete", witness, "--why", "wrong too", code=1).stderr
+        assert f"retract {witness} instead" in said
+    assert nb.text() == before
+    nb.set("--retract", "c2", "--by", "c3", "--why", "wrong too")  # its words stay, so the reasons still read
+    nb.run("lint")
+
+
 def test_a_deleted_claim_cant_be_touched_again_nor_faked(nb):
     nb.seen("Fact")
     nb.seen("Other")

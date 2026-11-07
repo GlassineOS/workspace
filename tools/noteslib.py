@@ -57,6 +57,7 @@ class Item:
     text: str = ""
     retracted_by: str | None = None
     deleted: bool = False
+    deleted_by: str | None = None
 
     @property
     def tag(self) -> str:
@@ -99,8 +100,8 @@ def _read_claim(item: Item, problem) -> None:
     if not words:
         problem("a bullet with nothing in it")
         return
-    if _DELETED.match(words):
-        item.id, item.deleted, item.text = words.split(" ", 1)[0], True, words
+    if m := _DELETED.match(words):
+        item.id, item.deleted, item.deleted_by, item.text = m.group(1), True, m.group(3), words
         if item.section != "Log":
             problem(f"what's left of a deleted claim belongs in Log: {item.id}")
         return
@@ -236,6 +237,8 @@ def lint(text: str, only: set[str] | None = None) -> list[tuple[int, str]]:
                 problem(f"{name} rests on {base}, and no claim here has that id")
         if item.retracted_by and item.retracted_by not in ids:
             problem(f"{name} was retracted by {item.retracted_by}, and no claim here has that id")
+        if item.deleted_by and item.deleted_by not in ids:
+            problem(f"{name} was deleted by {item.deleted_by}, and no claim here has that id")
         if item.section != "Current" or not item.kind:
             continue
         if not item.id:
@@ -429,6 +432,10 @@ def delete(text: str, claim: str, why: str, by: str | None = None) -> tuple[str,
     if not why.strip():
         raise ToolError("a delete needs --why WORDS")
     item = _find(doc, claim)
+    named = [i.id for i in doc.items if i.id != claim and claim in (i.retracted_by, i.deleted_by)]
+    if named:
+        raise ToolError(f"{claim} is what showed {', '.join(named)} wrong, and a delete would leave that with no "
+                        f"reason to read: retract {claim} instead, which keeps its words in Log")
     dependents = _dependents(doc, claim)
     if by is not None:
         witness = _find(doc, by)

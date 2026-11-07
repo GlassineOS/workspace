@@ -597,6 +597,15 @@ def test_delete_refuses(nb, args, words):
     assert nb.text() == before
 
 
+def test_the_tool_deletes_a_user_claim_without_a_witness_because_it_cant_tell_who_asks(nb):
+    """Pinned as it is today, not as a verdict: CLAUDE.md shows `--by cM`, and the tool takes it as optional.
+    Whether a session must name one, with the person's own way of leaving it out, is for the maintainer."""
+    nb.set("Said by the person", "--user")
+    nb.set("--delete", "c1", "--why", "wrong")
+    assert nb.section("Current") == ""
+    assert f"- c1 DELETED {TODAY}: wrong\n" in nb.section("Log")
+
+
 def test_lint_checks_the_claim_a_deleted_line_names(nb):
     dangling = page(log=f"### {TODAY}\n- c1 DELETED {TODAY} by c99: hand\n")
     assert [said for _, said in noteslib.lint(dangling)] == ["c1 was deleted by c99, and no claim here has that id"]

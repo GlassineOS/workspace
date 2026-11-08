@@ -67,3 +67,6 @@ url = "git@github.com:GlassineOS/sway.git"
 
 [repo."rnote"]
 url = "git@github.com:GlassineOS/rnote.git"
+
+[repo."qrtr-diag-sink"]
+url = "git@github.com:GlassineOS/qrtr-diag-sink.git"
